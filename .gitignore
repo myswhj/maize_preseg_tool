@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 模型文件
+*.pth
+*.pt
+
+# 导出数据
+coco_ljy/
+coco_dcz/
+coco_lyz/
+coco_cjx/
+coco_xfq/
+sam_val_img/
+sam_stem_tassel_models/
+sam_stem_tassel_val_img/
+maskrcnn.py
+maskrcnn_models/
+maskrcnn_new_val/
+maskrcnn_val_img/
+img/
+coco_coco/
+beifen.py
