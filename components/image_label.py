@@ -170,6 +170,12 @@ class ImageLabel(QLabel):
         return f"formal:{int(owner_id)}:{int(polygon_index)}"
 
     @staticmethod
+    def _make_removal_entity_id(owner_kind, owner_id, polygon_index):
+        if owner_kind == "preview":
+            return f"preview_removal:{int(polygon_index)}"
+        return f"formal_removal:{int(owner_id)}:{int(polygon_index)}"
+
+    @staticmethod
     def _parse_staging_entity_id(entity_id):
         parts = str(entity_id or "").split(":")
         if len(parts) == 2 and parts[0] == "preview":
@@ -184,11 +190,42 @@ class ImageLabel(QLabel):
                 return None
         return None
 
+    @staticmethod
+    def _parse_removal_entity_id(entity_id):
+        parts = str(entity_id or "").split(":")
+        if len(parts) == 2 and parts[0] == "preview_removal":
+            try:
+                return {"owner_kind": "preview", "owner_id": None, "polygon_index": int(parts[1])}
+            except (TypeError, ValueError):
+                return None
+        if len(parts) == 3 and parts[0] == "formal_removal":
+            try:
+                return {"owner_kind": "formal", "owner_id": int(parts[1]), "polygon_index": int(parts[2])}
+            except (TypeError, ValueError):
+                return None
+        return None
+
     def _ensure_label_slots(self, labels, polygon_count):
         normalized = list(labels or [])
         while len(normalized) < polygon_count:
             normalized.append("stem")
         return normalized
+
+    def _is_outer_polygon(self, polygon):
+        return len(polygon or []) >= 3 and self._get_polygon_area(polygon) <= 0
+
+    def _get_outer_polygon_indices(self, polygons):
+        return [index for index, polygon in enumerate(polygons or []) if self._is_outer_polygon(polygon)]
+
+    def _normalize_labels_for_polygons(self, labels, polygons):
+        outer_indices = self._get_outer_polygon_indices(polygons)
+        normalized = list(labels or [])[:len(outer_indices)]
+        while len(normalized) < len(outer_indices):
+            normalized.append("stem")
+        return normalized, outer_indices
+
+    def _get_inner_polygon_indices(self, polygons):
+        return [index for index, polygon in enumerate(polygons or []) if len(polygon or []) >= 3 and self._get_polygon_area(polygon) > 0]
 
     def _find_plant_by_id(self, plant_id):
         for plant in self.plants:
@@ -221,17 +258,19 @@ class ImageLabel(QLabel):
         if not plant:
             return None
         polygons = plant.get("polygons", [])
-        if polygon_index < 0 or polygon_index >= len(polygons):
-            return None
-        labels = self._ensure_label_slots(plant.get("labels", []), len(polygons))
+        labels, outer_indices = self._normalize_labels_for_polygons(plant.get("labels", []), polygons)
         plant["labels"] = labels
+        if polygon_index < 0 or polygon_index >= len(outer_indices):
+            return None
+        resolved_polygon_index = outer_indices[polygon_index]
         return {
             "id": self._make_staging_entity_id("formal", plant.get("id"), polygon_index),
             "owner_kind": "formal",
             "owner_id": plant.get("id"),
             "polygon_index": polygon_index,
-            "polygon": polygons[polygon_index],
-            "polygons": [polygons[polygon_index]],
+            "actual_polygon_index": resolved_polygon_index,
+            "polygon": polygons[resolved_polygon_index],
+            "polygons": [polygons[resolved_polygon_index]],
             "label": self._label_for_index(labels, polygon_index),
             "plant": plant,
         }
@@ -458,6 +497,10 @@ class ImageLabel(QLabel):
             staging = self._resolve_staging_entity(self.selected_entity_id)
             if staging:
                 return "staging", staging
+        elif self.selected_entity_kind == "removal":
+            removal = self._resolve_removal_entity(self.selected_entity_id)
+            if removal:
+                return "removal", removal
 
         return None, None
 
@@ -521,7 +564,7 @@ class ImageLabel(QLabel):
             plant = staging["plant"]
             old_polygons = copy.deepcopy(plant.get("polygons", []))
             old_labels = copy.deepcopy(plant.get("labels", []))
-            labels = self._ensure_label_slots(plant.get("labels", []), len(plant.get("polygons", [])))
+            labels, _ = self._normalize_labels_for_polygons(plant.get("labels", []), plant.get("polygons", []))
             labels[polygon_index] = new_label
             plant["labels"] = labels
             touch_instance(plant, "ai_modified" if plant.get("source") in ("ai_accepted", "ai_assisted") else None)
@@ -2733,12 +2776,19 @@ class ImageLabel(QLabel):
             if self._point_hits_polygons(image_pos, candidate.get("polygons", [])):
                 return "candidate", candidate.get("candidate_id")
 
+        for area in reversed(list(self._iter_preview_removal_areas())):
+            if self._point_hits_polygons(image_pos, area.get("polygons", [])):
+                return "removal", area.get("id")
+
         for area in reversed(list(self._iter_preview_staging_areas())):
             if self._point_hits_polygons(image_pos, area.get("polygons", [])):
                 return "staging", area.get("id")
 
         for plant in reversed(self.plants):
             if self.mode == "fine_tune" and int(plant.get("id", 0)) == int(self.fine_tune_instance_id or 0):
+                for area in reversed(list(self._iter_formal_removal_areas(plant))):
+                    if self._point_hits_polygons(image_pos, area.get("polygons", [])):
+                        return "removal", area.get("id")
                 for area in reversed(list(self._iter_formal_staging_areas(plant))):
                     if self._point_hits_polygons(image_pos, area.get("polygons", [])):
                         return "staging", area.get("id")
@@ -3227,6 +3277,17 @@ class ImageLabel(QLabel):
                         painter.drawPolygon(*qpts)
                         if is_staging_selected:
                             self._draw_polygon_vertices(painter, img_to_screen, [polygon], QColor(0, 150, 255))
+                for area in self._iter_formal_removal_areas(plant):
+                    area_id = area.get("id")
+                    is_removal_selected = self.selected_entity_kind == "removal" and self.selected_entity_id == str(area_id)
+                    polygon = area.get("polygon", [])
+                    if len(polygon) >= 3:
+                        qpts = [img_to_screen(point) for point in polygon]
+                        if is_removal_selected:
+                            painter.setBrush(QBrush(QColor(255, 80, 80, 65)))
+                            painter.setPen(QPen(QColor(255, 60, 60), 2, Qt.DashLine))
+                            painter.drawPolygon(*qpts)
+                            self._draw_polygon_vertices(painter, img_to_screen, [polygon], QColor(255, 60, 60))
                 staging_areas = plant.get("staging_areas", [])
                 for area in staging_areas:
                     area_id = area.get("id", 0)
@@ -3334,7 +3395,7 @@ class ImageLabel(QLabel):
             
             # 绘制去除区域（挖空效果）
             if self.removal_regions:
-                for region in self.removal_regions:
+                for index, region in enumerate(self.removal_regions):
                     if len(region) >= 3:
                         qpts = [img_to_screen(point) for point in region]
                         # 使用组合模式实现挖空
@@ -3342,6 +3403,15 @@ class ImageLabel(QLabel):
                         temp_painter.setBrush(QBrush(QColor(255, 255, 255, 255)))
                         temp_painter.setPen(QPen(QColor(255, 255, 255, 255), 2))
                         temp_painter.drawPolygon(*qpts)
+                        if (
+                            self.selected_entity_kind == "removal"
+                            and self.selected_entity_id == self._make_removal_entity_id("preview", None, index)
+                        ):
+                            temp_painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+                            temp_painter.setBrush(QBrush(QColor(255, 80, 80, 65)))
+                            temp_painter.setPen(QPen(QColor(255, 60, 60), 2, Qt.DashLine))
+                            temp_painter.drawPolygon(*qpts)
+                            self._draw_polygon_vertices(temp_painter, img_to_screen, [region], QColor(255, 60, 60))
             
             temp_painter.end()
             # 将临时pixmap绘制到主画布
@@ -3447,6 +3517,409 @@ class ImageLabel(QLabel):
                 main_win.refresh_properties_panel()
             if hasattr(main_win, "_update_staging_controls"):
                 main_win._update_staging_controls()
+
+    def _iter_formal_staging_areas(self, plant):
+        polygons = plant.get("polygons", [])
+        labels, outer_indices = self._normalize_labels_for_polygons(plant.get("labels", []), polygons)
+        plant["labels"] = labels
+        for label_index, polygon_index in enumerate(outer_indices):
+            polygon = polygons[polygon_index]
+            yield {
+                "id": self._make_staging_entity_id("formal", plant.get("id"), label_index),
+                "owner_kind": "formal",
+                "owner_id": plant.get("id"),
+                "polygon_index": label_index,
+                "actual_polygon_index": polygon_index,
+                "polygon": polygon,
+                "polygons": [polygon],
+                "label": self._label_for_index(labels, label_index),
+                "plant": plant,
+            }
+
+    def _iter_preview_removal_areas(self):
+        for index, polygon in enumerate(self.removal_regions):
+            yield {
+                "id": self._make_removal_entity_id("preview", None, index),
+                "owner_kind": "preview",
+                "owner_id": None,
+                "polygon_index": index,
+                "polygon": polygon,
+                "polygons": [polygon],
+            }
+
+    def _iter_formal_removal_areas(self, plant):
+        polygons = plant.get("polygons", [])
+        for hole_index, polygon_index in enumerate(self._get_inner_polygon_indices(polygons)):
+            polygon = polygons[polygon_index]
+            yield {
+                "id": self._make_removal_entity_id("formal", plant.get("id"), hole_index),
+                "owner_kind": "formal",
+                "owner_id": plant.get("id"),
+                "polygon_index": hole_index,
+                "actual_polygon_index": polygon_index,
+                "polygon": polygon,
+                "polygons": [polygon],
+                "plant": plant,
+            }
+
+    def _resolve_removal_entity(self, entity_id=None):
+        parsed = self._parse_removal_entity_id(entity_id or self.selected_entity_id)
+        if not parsed:
+            return None
+
+        polygon_index = parsed["polygon_index"]
+        if parsed["owner_kind"] == "preview":
+            if polygon_index < 0 or polygon_index >= len(self.removal_regions):
+                return None
+            polygon = self.removal_regions[polygon_index]
+            return {
+                "id": self._make_removal_entity_id("preview", None, polygon_index),
+                "owner_kind": "preview",
+                "owner_id": None,
+                "polygon_index": polygon_index,
+                "polygon": polygon,
+                "polygons": [polygon],
+            }
+
+        plant = self._find_plant_by_id(parsed["owner_id"])
+        if not plant:
+            return None
+        inner_indices = self._get_inner_polygon_indices(plant.get("polygons", []))
+        if polygon_index < 0 or polygon_index >= len(inner_indices):
+            return None
+        actual_polygon_index = inner_indices[polygon_index]
+        polygon = plant.get("polygons", [])[actual_polygon_index]
+        return {
+            "id": self._make_removal_entity_id("formal", plant.get("id"), polygon_index),
+            "owner_kind": "formal",
+            "owner_id": plant.get("id"),
+            "polygon_index": polygon_index,
+            "actual_polygon_index": actual_polygon_index,
+            "polygon": polygon,
+            "polygons": [polygon],
+            "plant": plant,
+        }
+
+    def update_selected_staging_label(self, new_label):
+        selected_kind, staging = self.get_selected_entity()
+        if selected_kind != "staging" or not staging:
+            return False, "请先选择一个暂存区域"
+
+        polygon_index = staging["polygon_index"]
+        if staging["owner_kind"] == "preview":
+            old_polygons = copy.deepcopy(self.current_plant_polygons)
+            old_labels = copy.deepcopy(self.current_plant_labels)
+            self.current_plant_labels = self._ensure_label_slots(self.current_plant_labels, len(self.current_plant_polygons))
+            self.current_plant_labels[polygon_index] = new_label
+            self._record_preview_state_change(
+                old_polygons,
+                old_labels,
+                "update_label",
+                {"polygon_index": polygon_index, "label": new_label},
+            )
+        else:
+            plant = staging["plant"]
+            old_polygons = copy.deepcopy(plant.get("polygons", []))
+            old_labels = copy.deepcopy(plant.get("labels", []))
+            labels, _ = self._normalize_labels_for_polygons(plant.get("labels", []), plant.get("polygons", []))
+            labels[polygon_index] = new_label
+            plant["labels"] = labels
+            touch_instance(plant, "ai_modified" if plant.get("source") in ("ai_accepted", "ai_assisted") else None)
+            self._record_fine_tune_state_change(
+                plant,
+                old_polygons,
+                old_labels,
+                "update_label",
+                {"polygon_index": polygon_index, "label": new_label},
+            )
+            self._notify_preannotation_adjustment(
+                plant.get("id"),
+                "update_staging_label",
+                {"polygon_index": polygon_index, "label": new_label},
+            )
+
+        self._notify_annotation_changed()
+        self.update_display()
+        return True, "暂存区域标签已更新"
+
+    def delete_selected_staging_polygon(self):
+        selected_kind, staging = self.get_selected_entity()
+        if selected_kind == "removal" and staging:
+            if staging["owner_kind"] == "preview":
+                old_regions = copy.deepcopy(self.removal_regions)
+                polygon_index = staging["polygon_index"]
+                if polygon_index < 0 or polygon_index >= len(self.removal_regions):
+                    return False, "请先选择一个去除区域"
+                del self.removal_regions[polygon_index]
+                self.selected_entity_kind = None
+                self.selected_entity_id = None
+                self.main_stack.append(
+                    {
+                        "action": "save_removal_region",
+                        "regions": old_regions,
+                        "current_removal_points": self.current_removal_points.copy(),
+                    }
+                )
+                if len(self.main_stack) > self.max_stack_depth:
+                    self.main_stack.pop(0)
+                self.redo_main_stack = []
+            else:
+                plant = staging["plant"]
+                polygons = copy.deepcopy(plant.get("polygons", []))
+                actual_polygon_index = staging.get("actual_polygon_index")
+                if actual_polygon_index is None or actual_polygon_index < 0 or actual_polygon_index >= len(polygons):
+                    return False, "请先选择一个去除区域"
+                old_polygons = copy.deepcopy(polygons)
+                old_labels = copy.deepcopy(plant.get("labels", []))
+                del polygons[actual_polygon_index]
+                plant["polygons"] = normalize_polygons(polygons)
+                labels, _ = self._normalize_labels_for_polygons(plant.get("labels", []), plant["polygons"])
+                plant["labels"] = labels
+                touch_instance(plant, "ai_modified" if plant.get("source") in ("ai_accepted", "ai_assisted") else None)
+                self.selected_entity_kind = "formal"
+                self.selected_entity_id = str(plant.get("id"))
+                self._record_fine_tune_state_change(
+                    plant,
+                    old_polygons,
+                    old_labels,
+                    "delete_removal_region",
+                    {"polygon_index": staging["polygon_index"], "actual_polygon_index": actual_polygon_index},
+                )
+                self._notify_preannotation_adjustment(
+                    plant.get("id"),
+                    "delete_removal_region",
+                    {"polygon_index": staging["polygon_index"], "actual_polygon_index": actual_polygon_index},
+                )
+
+            self.set_split_staging_mode(False)
+            self._notify_annotation_changed()
+            self.update_display()
+            return True, "去除区域已删除"
+
+        if selected_kind != "staging" or not staging:
+            return False, "请先选择一个暂存区域或去除区域"
+
+        polygon_index = staging["polygon_index"]
+        if staging["owner_kind"] == "preview":
+            if len(self.current_plant_polygons) <= 1:
+                return False, "至少保留一个暂存区域后再删除"
+            old_polygons = copy.deepcopy(self.current_plant_polygons)
+            old_labels = copy.deepcopy(self.current_plant_labels)
+            del self.current_plant_polygons[polygon_index]
+            labels = self._ensure_label_slots(self.current_plant_labels, len(old_polygons))
+            del labels[polygon_index]
+            self.current_plant_labels = labels
+            self.selected_entity_kind = None
+            self.selected_entity_id = None
+            self._record_preview_state_change(
+                old_polygons,
+                old_labels,
+                "delete_polygon",
+                {"polygon_index": polygon_index},
+            )
+        else:
+            plant = staging["plant"]
+            polygons = plant.get("polygons", [])
+            outer_indices = self._get_outer_polygon_indices(polygons)
+            if len(outer_indices) <= 1:
+                return False, "至少保留一个暂存区域后再删除"
+            old_polygons = copy.deepcopy(polygons)
+            old_labels = copy.deepcopy(plant.get("labels", []))
+            actual_polygon_index = staging.get("actual_polygon_index", outer_indices[polygon_index])
+            del polygons[actual_polygon_index]
+            labels, _ = self._normalize_labels_for_polygons(plant.get("labels", []), old_polygons)
+            del labels[polygon_index]
+            plant["polygons"] = normalize_polygons(polygons)
+            plant["labels"] = labels
+            touch_instance(plant, "ai_modified" if plant.get("source") in ("ai_accepted", "ai_assisted") else None)
+            self.selected_entity_kind = "formal"
+            self.selected_entity_id = str(plant.get("id"))
+            self._record_fine_tune_state_change(
+                plant,
+                old_polygons,
+                old_labels,
+                "delete_polygon",
+                {"polygon_index": polygon_index},
+            )
+            self._notify_preannotation_adjustment(
+                plant.get("id"),
+                "delete_staging_polygon",
+                {"polygon_index": polygon_index},
+            )
+
+        self.set_split_staging_mode(False)
+        self._notify_annotation_changed()
+        self.update_display()
+        return True, "暂存区域已删除"
+
+    def split_selected_staging_polygon(self, line_start, line_end, gap=5):
+        selected_kind, staging = self.get_selected_entity()
+        if selected_kind != "staging" or not staging:
+            return False, "请先选择一个暂存区域"
+
+        polygon = staging.get("polygon", [])
+        if len(polygon) < 3:
+            return False, "当前暂存区域无法切割"
+
+        if math.dist((float(line_start[0]), float(line_start[1])), (float(line_end[0]), float(line_end[1]))) < 3:
+            return False, "切割线太短"
+
+        x_coords = [point[0] for point in polygon]
+        y_coords = [point[1] for point in polygon]
+        padding = max(8, int(gap) + 6)
+        min_x = math.floor(min(x_coords)) - padding
+        min_y = math.floor(min(y_coords)) - padding
+        max_x = math.ceil(max(x_coords)) + padding
+        max_y = math.ceil(max(y_coords)) + padding
+        width = max(2, int(max_x - min_x + 1))
+        height = max(2, int(max_y - min_y + 1))
+        mask = np.zeros((height, width), dtype=np.uint8)
+
+        local_polygon = np.array(
+            [[int(round(point[0] - min_x)), int(round(point[1] - min_y))] for point in polygon],
+            dtype=np.int32,
+        )
+        cv2.fillPoly(mask, [local_polygon], 255)
+
+        local_start = (int(round(line_start[0] - min_x)), int(round(line_start[1] - min_y)))
+        local_end = (int(round(line_end[0] - min_x)), int(round(line_end[1] - min_y)))
+        cv2.line(mask, local_start, local_end, 0, thickness=max(5, int(gap)))
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        split_polygons = []
+        for contour in contours:
+            if cv2.contourArea(contour) < 20:
+                continue
+            epsilon = max(1.0, 0.003 * cv2.arcLength(contour, True))
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            points = [(float(point[0][0] + min_x), float(point[0][1] + min_y)) for point in approx]
+            normalized = normalize_polygons([points])
+            if normalized:
+                split_polygons.append(normalized[0])
+
+        split_polygons.sort(key=lambda item: abs(calculate_polygon_area(item)), reverse=True)
+        if len(split_polygons) < 2:
+            return False, "切割后没有得到两个有效区域"
+        if len(split_polygons) > 2:
+            split_polygons = split_polygons[:2]
+
+        polygon_index = staging["polygon_index"]
+        label = staging.get("label", "stem")
+        if staging["owner_kind"] == "preview":
+            old_polygons = copy.deepcopy(self.current_plant_polygons)
+            old_labels = copy.deepcopy(self.current_plant_labels)
+            self.current_plant_polygons = (
+                self.current_plant_polygons[:polygon_index]
+                + split_polygons
+                + self.current_plant_polygons[polygon_index + 1:]
+            )
+            labels = self._ensure_label_slots(self.current_plant_labels, len(old_polygons))
+            self.current_plant_labels = labels[:polygon_index] + [label, label] + labels[polygon_index + 1:]
+            self._record_preview_state_change(
+                old_polygons,
+                old_labels,
+                "split_polygon",
+                {"polygon_index": polygon_index, "gap": gap},
+            )
+            self.select_entity("staging", self._make_staging_entity_id("preview", None, polygon_index))
+        else:
+            plant = staging["plant"]
+            old_polygons = copy.deepcopy(plant.get("polygons", []))
+            old_labels = copy.deepcopy(plant.get("labels", []))
+            actual_polygon_index = staging.get("actual_polygon_index", polygon_index)
+            polygons = plant.get("polygons", [])
+            plant["polygons"] = polygons[:actual_polygon_index] + split_polygons + polygons[actual_polygon_index + 1:]
+            labels, _ = self._normalize_labels_for_polygons(plant.get("labels", []), old_polygons)
+            plant["labels"] = labels[:polygon_index] + [label, label] + labels[polygon_index + 1:]
+            touch_instance(plant, "ai_modified" if plant.get("source") in ("ai_accepted", "ai_assisted") else None)
+            self._record_fine_tune_state_change(
+                plant,
+                old_polygons,
+                old_labels,
+                "split_polygon",
+                {"polygon_index": polygon_index, "gap": gap},
+            )
+            self._notify_preannotation_adjustment(
+                plant.get("id"),
+                "split_staging_polygon",
+                {"polygon_index": polygon_index, "gap": gap},
+            )
+            self.select_entity("staging", self._make_staging_entity_id("formal", plant.get("id"), polygon_index))
+
+        self.set_split_staging_mode(False)
+        self._notify_annotation_changed()
+        self.update_display()
+        return True, "暂存区域已切割为两个区域"
+
+    def confirm_preview_and_save(self):
+        """覆盖旧逻辑：去除区域只作为内洞，不产生 label。"""
+        if self.is_summary:
+            return False
+        if self.current_points:
+            self.save_current_polygon()
+        if self.current_removal_points:
+            self.save_current_removal_region()
+        if len(self.current_plant_polygons) == 0:
+            return False
+
+        final_polygons = []
+        final_labels = []
+        for i, poly in enumerate(self.current_plant_polygons):
+            if len(poly) < 3:
+                continue
+            if poly[0] != poly[-1]:
+                poly = poly + [poly[0]]
+            if self._get_polygon_area(poly) > 0:
+                poly = poly[::-1]
+            final_polygons.append(poly)
+            final_labels.append(self.current_plant_labels[i] if i < len(self.current_plant_labels) else "stem")
+
+        for removal_poly in self.removal_regions:
+            if len(removal_poly) < 3:
+                continue
+            removal_copy = removal_poly + [removal_poly[0]] if removal_poly[0] != removal_poly[-1] else removal_poly.copy()
+            x_coords = [p[0] for p in removal_copy]
+            y_coords = [p[1] for p in removal_copy]
+            center_point = (sum(x_coords) / len(x_coords), sum(y_coords) / len(y_coords))
+            for outer_contour in final_polygons:
+                if self._point_in_polygon(center_point, outer_contour):
+                    intersection_poly = self._polygon_intersection(outer_contour, removal_copy)
+                    if intersection_poly and len(intersection_poly) >= 3:
+                        if self._get_polygon_area(intersection_poly) < 0:
+                            intersection_poly = intersection_poly[::-1]
+                        final_polygons.append(intersection_poly)
+                    break
+
+        if not final_polygons:
+            return False
+
+        if hasattr(self, "_original_plant_id") and self._original_plant_id:
+            instance_id = self._original_plant_id
+            delattr(self, "_original_plant_id")
+        else:
+            instance_id = self.current_plant_id
+            self.current_plant_id += 1
+
+        new_instance = make_formal_instance(instance_id=instance_id, polygons=final_polygons, source="manual")
+        new_instance["labels"] = final_labels
+        self.plants.append(new_instance)
+        self.plants.sort(key=lambda item: int(item.get("id", 0)))
+        self.main_stack.append({"action": "confirm_preview", "instance": copy.deepcopy(new_instance)})
+        if len(self.main_stack) > self.max_stack_depth:
+            self.main_stack.pop(0)
+        self.redo_main_stack = []
+
+        self.current_plant_polygons = []
+        self.current_plant_labels = []
+        self.removal_regions = []
+        self.current_points = []
+        self.current_removal_points = []
+        self.current_snap_point = None
+        self.selected_entity_kind = "formal"
+        self.selected_entity_id = str(instance_id)
+        self.update_display()
+        self._notify_selection_changed()
+        return instance_id
 
     def get_main_window(self):
         """获取主窗口。"""

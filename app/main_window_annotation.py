@@ -15,11 +15,13 @@ class MainWindowAnnotationMixin:
         selected_kind, _ = self.left_label.get_selected_entity()
         vertex_mode_active = self.left_label.add_vertex_mode or getattr(self.left_label, "delete_vertex_mode", False)
         has_staging = in_fine_tune and (not vertex_mode_active) and selected_kind == "staging"
+        has_removal = (not vertex_mode_active) and selected_kind == "removal"
+        can_delete_area = has_staging or has_removal
 
         if hasattr(self, "btn_apply_staging_label"):
             self.btn_apply_staging_label.setEnabled(has_staging)
         if hasattr(self, "btn_delete_staging_polygon"):
-            self.btn_delete_staging_polygon.setEnabled(has_staging)
+            self.btn_delete_staging_polygon.setEnabled(can_delete_area)
         if hasattr(self, "btn_split_staging_polygon"):
             self.btn_split_staging_polygon.setEnabled(has_staging)
             self.btn_split_staging_polygon.setText(
@@ -86,7 +88,7 @@ class MainWindowAnnotationMixin:
 
     def delete_selected_staging_polygon_shortcut(self):
         selected_kind, _ = self.left_label.get_selected_entity()
-        if selected_kind != "staging":
+        if selected_kind not in ("staging", "removal"):
             return
         self.delete_selected_staging_polygon()
     def toggle_split_staging_polygon(self):
@@ -208,16 +210,6 @@ class MainWindowAnnotationMixin:
         else:
             self.btn_removal_region.setText("去除区域 (R)")
             self.left_label.removing_region = False
-
-    def toggle_ai_assist(self):
-        """切换 AI 辅助功能。"""
-        self.ai_assist_enabled = not getattr(self, "ai_assist_enabled", True)
-        if self.ai_assist_enabled:
-            self.btn_toggle_ai.setText("AI辅助: 开启")
-        else:
-            self.btn_toggle_ai.setText("AI辅助: 关闭")
-        self.left_label.update_display()
-        self.update_status_bar()
 
     def toggle_projection(self):
         """切换投影框显示。"""
@@ -678,11 +670,6 @@ class MainWindowAnnotationMixin:
             status_parts.append("投影框: 开启")
         else:
             status_parts.append("投影框: 关闭")
-
-        if getattr(self, "ai_assist_enabled", True):
-            status_parts.append("AI辅助: 开启")
-        else:
-            status_parts.append("AI辅助: 关闭")
 
         if self.left_label.preannotation_box_mode:
             status_parts.append("框选预标注模式")

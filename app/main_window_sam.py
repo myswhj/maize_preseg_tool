@@ -11,6 +11,41 @@ from .workers import SamTrainingWorker
 
 
 class MainWindowSamMixin:
+    def _prompt_load_sam_model(self, prompt_message="请先加载SAM模型"):
+        """显式提示用户选择模型，不做自动导入或自动恢复。"""
+        reply = QMessageBox.question(
+            self,
+            "加载SAM模型",
+            f"{prompt_message}\n\n是否现在选择并加载模型？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return False
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择SAM模型文件", "", "模型文件 (*.pth)"
+        )
+        if not file_path:
+            self.sam_info_text.append("已取消选择SAM模型文件")
+            return False
+
+        model_type, ok = QInputDialog.getItem(
+            self,
+            "选择模型类型",
+            "请选择SAM模型类型:",
+            ["vit_b", "vit_l", "vit_h"],
+            0,
+            False,
+        )
+        if not ok:
+            self.sam_info_text.append("已取消选择SAM模型类型")
+            return False
+
+        self.sam_manager.load_model(file_path, model_type=model_type)
+        self.sam_info_text.append(f"SAM模型加载成功 (类型: {model_type})")
+        return True
+
     def debug_print_coco_container(self):
         """调试函数：打印COCO容器内的信息"""
         from utils.data_manager import debug_print_coco_container
@@ -505,3 +540,101 @@ class MainWindowSamMixin:
         self.preannotation_adjustment_records = current_records_backup
         self.current_image_path = current_image_backup
         QMessageBox.information(self, "导出完成", f"成功导出 {exported_count} 个文件，跳过 {skipped_count} 个文件")
+    def _ensure_sam_model_loaded_interactive(self, prompt_message):
+        """确保模型加载流程一致：不自动恢复，只在用户确认后显式选择。"""
+        if self.sam_manager.has_model_loaded():
+            return True
+        try:
+            return self._prompt_load_sam_model(prompt_message=prompt_message)
+        except Exception as error:
+            self.sam_info_text.append(f"加载失败: {str(error)}")
+            QMessageBox.warning(self, "失败", f"加载SAM模型失败: {str(error)}")
+            return False
+
+    def load_sam_model(self):
+        """覆盖旧入口：仅显式加载，不做自动导入。"""
+        loaded = self._ensure_sam_model_loaded_interactive("请选择一个SAM模型文件")
+        if loaded:
+            QMessageBox.information(self, "成功", f"SAM模型加载成功 (类型: {self.sam_manager.model_type})")
+    def start_sam_training(self):
+        """覆盖旧流程：训练前允许用户就地显式加载模型。"""
+        if self.sam_training_worker and self.sam_training_worker.isRunning():
+            QMessageBox.information(self, "提示", "SAM训练正在进行中")
+            return
+
+        if not self._ensure_sam_model_loaded_interactive("开始训练前需要先加载SAM模型"):
+            return
+
+        if self.left_label.mode == "fine_tune":
+            QMessageBox.warning(self, "警告", "请先退出当前微调模式，再执行框选预标注")
+            return
+
+        self.sam_info_text.append(f"COCO容器大小: {len(self.coco_container)}")
+        for image_path, annotation in self.coco_container.items():
+            image_state = annotation.get("image_state", {})
+            completed = image_state.get("annotation_completed", False)
+            self.sam_info_text.append(f"图片: {os.path.basename(image_path)}, 已完成: {completed}")
+
+        completed_count = sum(
+            1
+            for ann in self.coco_container.values()
+            if ann.get("image_state", {}).get("annotation_completed", False)
+        )
+        self.sam_info_text.append(f"已完成图片数量: {completed_count}")
+
+        if completed_count <= 0:
+            QMessageBox.warning(self, "警告", "当前项目还没有已完成图片，无法开始训练")
+            return
+
+        if not self.image_paths:
+            QMessageBox.warning(self, "警告", "请先加载图片")
+            return
+
+        self.sam_info_text.append("开始训练...")
+        self.btn_load_sam.setEnabled(False)
+        self.btn_sam_train.setEnabled(False)
+        self.btn_sam_train.setText("训练中...")
+        self.btn_sam_preannotate.setEnabled(False)
+
+        self.sam_training_worker = SamTrainingWorker(
+            self.sam_training_manager,
+            self.coco_container,
+            self.image_paths,
+        )
+        self.sam_training_worker.finished_signal.connect(self._handle_sam_training_finished)
+        self.sam_training_worker.finished.connect(self._cleanup_sam_training_worker)
+        self.sam_training_worker.start()
+
+    def run_sam_preannotation(self):
+        """覆盖旧流程：预标注前允许用户就地显式加载模型。"""
+        if not self.current_image_path:
+            QMessageBox.warning(self, "警告", "请先加载图片")
+            return
+
+        if not self._ensure_sam_model_loaded_interactive("预标注前需要先加载SAM模型"):
+            return
+
+        if self.left_label.preannotation_box_mode:
+            self.left_label.set_preannotation_box_mode(False)
+            self.left_label.clear_preannotation_box()
+            self.sam_info_text.append("已取消框选预标注")
+            self._update_preannotation_controls()
+            return
+
+        if self.left_label.candidate_instances:
+            reply = QMessageBox.question(
+                self,
+                "覆盖当前候选",
+                "当前还有未处理的预标注候选，是否丢弃并重新框选？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            self._clear_preannotation_candidate()
+
+        self.left_label.set_preannotation_box_mode(True)
+        if hasattr(self, "sync_interaction_state"):
+            self.sync_interaction_state()
+        self.sam_info_text.append("请在左侧画布拖拽一个虚线框进行预标注")
+        self._update_preannotation_controls()

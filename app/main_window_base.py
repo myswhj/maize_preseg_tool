@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
 from config import SHORTCUTS
 from components.image_label import ImageLabel
 from components.toolbars import Toolbars
+from components.toolbars import _apply_toolbar_button_accents
 from models.sam_manager import SamManager
 from services.sam_training_manager import SamTrainingManagerV2
 from ui.annotation_properties_panel import AnnotationPropertiesPanel
@@ -65,10 +66,13 @@ class MainWindowBase(QMainWindow):
         self.preannotation_fine_tune_sessions = {}
         self.interaction_state_machine = InteractionStateMachine()
 
+        self.apply_window_theme()
         self.init_ui()
+        _apply_toolbar_button_accents(self)
         self.resize_to_available_screen()
         self.init_shortcuts()
         self.restore_button_texts()
+        self.apply_toolbar_compaction()
         self.restore_button_visuals()
         self._update_preannotation_controls()
 
@@ -88,6 +92,162 @@ class MainWindowBase(QMainWindow):
         if self.current_image_index >= 0:
             return self.current_image_index + 1
         return None
+
+    def apply_window_theme(self):
+        """统一主窗口和工具栏视觉风格。"""
+        self.setStyleSheet(
+            """
+            QMainWindow {
+                background: #f3f1ec;
+            }
+            QWidget {
+                color: #2f241d;
+                font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+                font-size: 13px;
+            }
+            QScrollArea {
+                background: transparent;
+                border: none;
+            }
+            QGroupBox {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #fbfaf7, stop:1 #f1eee7);
+                border: 1px solid #ddd7cb;
+                border-radius: 14px;
+                margin-top: 10px;
+                padding: 14px 10px 10px 10px;
+                font-weight: 700;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 2px 7px;
+                color: #7d6757;
+                background: #f4f0e8;
+                border-radius: 7px;
+            }
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #faf8f3, stop:1 #efe9df);
+                border: 1px solid #d5ccbe;
+                border-radius: 10px;
+                padding: 8px 10px;
+                text-align: left;
+                font-weight: 600;
+            }
+            QPushButton[accent="primary"] {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #d98f52, stop:1 #b76534);
+                color: #fffaf5;
+                border: 1px solid #9f532b;
+            }
+            QPushButton[accent="primary"]:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #e39c62, stop:1 #c56f3b);
+                border: 1px solid #8f4723;
+            }
+            QPushButton[accent="muted"] {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #e8e5df, stop:1 #d8d3ca);
+                color: #3f3a34;
+                border: 1px solid #b9b1a5;
+            }
+            QPushButton[accent="muted"]:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #dfdbd4, stop:1 #ccc6bc);
+                border: 1px solid #9f978a;
+            }
+            QPushButton[accent="danger"] {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #f8d7cf, stop:1 #df8e7b);
+                border: 1px solid #be5d48;
+                color: #5a1f12;
+            }
+            QPushButton[accent="danger"]:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #f4c8bc, stop:1 #d97a64);
+                border: 1px solid #a84d39;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #f7f3ea, stop:1 #ebe3d6);
+                border: 1px solid #c9bead;
+            }
+            QPushButton:pressed {
+                background: #e7dfd2;
+                border: 1px solid #bcae98;
+            }
+            QPushButton:disabled {
+                background: #ebe7df;
+                color: #988677;
+                border: 1px solid #d3c4b4;
+            }
+            QComboBox, QTextEdit {
+                background: #fffdf9;
+                border: 1px solid #d8c4ad;
+                border-radius: 9px;
+                padding: 5px 8px;
+                selection-background-color: #d98f52;
+                selection-color: white;
+            }
+            QComboBox:hover, QTextEdit:hover {
+                border: 1px solid #c98d5b;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 22px;
+            }
+            QLabel {
+                color: #4c3b31;
+            }
+            QStatusBar {
+                background: #ece8de;
+                color: #5b4637;
+                border-top: 1px solid #d9d0c2;
+            }
+            QScrollBar:vertical {
+                background: #ebe7de;
+                width: 10px;
+                border-radius: 5px;
+                margin: 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: #c7baaa;
+                min-height: 30px;
+                border-radius: 5px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            """
+        )
+
+    def apply_toolbar_compaction(self):
+        """压缩过长文案并补充按钮语义样式。"""
+        if hasattr(self, "btn_delete_staging_polygon"):
+            self.btn_delete_staging_polygon.setText(f"删除选区/去除区 ({SHORTCUTS['DELETE_STAGING_POLYGON']})")
+        for button_name, accent in (
+            ("btn_save_plant", "primary"),
+            ("btn_sam_train", "primary"),
+            ("btn_sam_preannotate", "primary"),
+            ("btn_delete", "danger"),
+            ("btn_delete_staging_polygon", "danger"),
+            ("btn_removal_region", "danger"),
+            ("btn_refresh", "muted"),
+            ("btn_toggle_annotation", "muted"),
+            ("btn_prev", "muted"),
+            ("btn_next", "muted"),
+            ("btn_toggle_projection", "muted"),
+            ("btn_help", "muted"),
+            ("btn_debug_coco", "muted"),
+        ):
+            button = getattr(self, button_name, None)
+            if button is None:
+                continue
+            button.setProperty("accent", accent)
+            if button.style():
+                button.style().unpolish(button)
+                button.style().polish(button)
 
     def sync_interaction_state(self):
         if self.left_label.preannotation_box_mode:
@@ -122,7 +282,8 @@ class MainWindowBase(QMainWindow):
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setSpacing(10)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
         left_layout.addWidget(Toolbars.create_auxiliary_toolbar(self))
         left_layout.addWidget(Toolbars.create_annotation_toolbar(self))
         left_layout.addWidget(Toolbars.create_plant_management_toolbar(self))
@@ -153,7 +314,8 @@ class MainWindowBase(QMainWindow):
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setSpacing(10)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
 
         self.properties_panel = AnnotationPropertiesPanel(self)
         right_layout.addWidget(self.properties_panel, 3)
@@ -162,12 +324,12 @@ class MainWindowBase(QMainWindow):
         right_layout.addWidget(Toolbars.create_export_toolbar(self))
         right_layout.addWidget(Toolbars.create_aux_toolbar(self))
         right_layout.addStretch()
-        right_scroll = self.create_scroll_panel(right_panel, min_width=300, preferred_width=380)
+        right_scroll = self.create_scroll_panel(right_panel, min_width=280, preferred_width=330)
         main_splitter.addWidget(right_scroll)
         main_splitter.setStretchFactor(0, 0)
         main_splitter.setStretchFactor(1, 1)
         main_splitter.setStretchFactor(2, 0)
-        main_splitter.setSizes([260, 1200, 380])
+        main_splitter.setSizes([250, 1250, 320])
 
     def create_scroll_panel(self, widget, min_width, preferred_width):
         """为侧栏创建滚动容器，避免小分辨率下内容被截断。"""
@@ -227,7 +389,7 @@ class MainWindowBase(QMainWindow):
         if hasattr(self, "btn_delete"):
             self.btn_delete.setText(f"删除选中植株 ({SHORTCUTS['DELETE_PLANT']})")
         if hasattr(self, "btn_delete_staging_polygon"):
-            self.btn_delete_staging_polygon.setText(f"删除选中的暂存区域 ({SHORTCUTS['DELETE_STAGING_POLYGON']})")
+            self.btn_delete_staging_polygon.setText(f"删除选中的区域/去除区域 ({SHORTCUTS['DELETE_STAGING_POLYGON']})")
         if hasattr(self, "btn_delete_vertex"):
             self.btn_delete_vertex.setText("删除顶点")
         if hasattr(self, "btn_load_batch"):

@@ -152,6 +152,11 @@ def normalize_formal_instance(instance, fallback_id):
     created_at = instance.get("created_at") or current_timestamp()
     updated_at = instance.get("updated_at") or created_at
 
+    outer_polygon_count = sum(1 for polygon in polygons if calculate_polygon_area(polygon) < 0)
+    labels = list(instance.get("labels", []))[:outer_polygon_count]
+    while len(labels) < outer_polygon_count:
+        labels.append("stem")
+
     normalized = {
         "id": instance_id,
         "polygons": polygons,
@@ -163,7 +168,7 @@ def normalize_formal_instance(instance, fallback_id):
         "confirmed": bool(instance.get("confirmed", True)),
         "created_at": created_at,
         "updated_at": updated_at,
-        "labels": instance.get("labels", []),
+        "labels": labels,
         "preannotation_record_id": instance.get("preannotation_record_id"),
     }
     return normalized

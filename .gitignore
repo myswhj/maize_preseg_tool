@@ -15,8 +15,8 @@ __pycache__/
 Thumbs.db
 
 # 模型文件
-*.pth
 *.pt
+*.pth
 
 # 导出数据
 coco_ljy/

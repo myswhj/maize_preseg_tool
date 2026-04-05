@@ -11,6 +11,11 @@ from PyQt5.QtWidgets import (
 from config import SHORTCUTS
 
 
+class NoWheelComboBox(QComboBox):
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 class Toolbars:
     """工具栏组件管理。"""
 
@@ -62,7 +67,7 @@ class Toolbars:
         label_layout = QVBoxLayout()
         label_group.setLayout(label_layout)
 
-        parent.combo_label = QComboBox()
+        parent.combo_label = NoWheelComboBox()
         parent.combo_label.addItems(["stem", "leaf", "ear"])
         parent.combo_label.setMinimumWidth(150)
         label_layout.addWidget(parent.combo_label)
@@ -112,10 +117,6 @@ class Toolbars:
         parent.btn_clear_all_ignore.clicked.connect(parent.clear_all_ignore_regions)
         aux_func_layout.addWidget(parent.btn_clear_all_ignore)
 
-        parent.btn_toggle_ai = QPushButton("AI辅助: 开启")
-        parent.btn_toggle_ai.clicked.connect(parent.toggle_ai_assist)
-        aux_func_layout.addWidget(parent.btn_toggle_ai)
-
         return aux_func_group
 
     @staticmethod
@@ -124,7 +125,7 @@ class Toolbars:
         plant_layout = QVBoxLayout()
         plant_group.setLayout(plant_layout)
 
-        parent.combo_plants = QComboBox()
+        parent.combo_plants = NoWheelComboBox()
         parent.combo_plants.setMinimumWidth(150)
         plant_layout.addWidget(parent.combo_plants)
 
@@ -156,7 +157,7 @@ class Toolbars:
         plant_layout.addWidget(parent.btn_apply_staging_label)
 
         parent.btn_delete_staging_polygon = QPushButton(
-            f"删除选中的暂存区域 ({SHORTCUTS['DELETE_STAGING_POLYGON']})"
+            f"删除选中的区域/去除区域 ({SHORTCUTS['DELETE_STAGING_POLYGON']})"
         )
         parent.btn_delete_staging_polygon.clicked.connect(parent.delete_selected_staging_polygon)
         parent.btn_delete_staging_polygon.setEnabled(False)
@@ -250,3 +251,28 @@ class Toolbars:
         parent.image_progress_label = QLabel("0/0")
         parent.image_progress_label.setStyleSheet("font-size: 14px; font-weight: bold; padding: 5px;")
         return parent.image_progress_label
+
+
+def _apply_toolbar_button_accents(parent):
+    for button_name, accent in (
+        ("btn_save_plant", "primary"),
+        ("btn_sam_train", "primary"),
+        ("btn_sam_preannotate", "primary"),
+        ("btn_delete", "danger"),
+        ("btn_delete_staging_polygon", "danger"),
+        ("btn_removal_region", "danger"),
+        ("btn_refresh", "muted"),
+        ("btn_toggle_annotation", "muted"),
+        ("btn_prev", "muted"),
+        ("btn_next", "muted"),
+        ("btn_toggle_projection", "muted"),
+        ("btn_help", "muted"),
+        ("btn_debug_coco", "muted"),
+    ):
+        button = getattr(parent, button_name, None)
+        if button is None:
+            continue
+        button.setProperty("accent", accent)
+        if button.style():
+            button.style().unpolish(button)
+            button.style().polish(button)
