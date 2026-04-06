@@ -227,6 +227,82 @@ class ImageLabel(QLabel):
     def _get_inner_polygon_indices(self, polygons):
         return [index for index, polygon in enumerate(polygons or []) if len(polygon or []) >= 3 and self._get_polygon_area(polygon) > 0]
 
+    def _split_instance_polygons_for_preview(self, polygons, labels=None):
+        normalized_polygons = normalize_polygons(copy.deepcopy(polygons or []))
+        normalized_labels, outer_indices = self._normalize_labels_for_polygons(labels or [], normalized_polygons)
+        removal_indices = self._get_inner_polygon_indices(normalized_polygons)
+        preview_polygons = [copy.deepcopy(normalized_polygons[index]) for index in outer_indices]
+        preview_labels = [self._label_for_index(normalized_labels, index) for index in range(len(outer_indices))]
+        removal_regions = [copy.deepcopy(normalized_polygons[index]) for index in removal_indices]
+        return preview_polygons, preview_labels, removal_regions
+
+    def _compose_preview_instance_data(self):
+        preview_polygons = normalize_polygons(copy.deepcopy(self.current_plant_polygons))
+        if not preview_polygons:
+            return [], []
+
+        preview_labels = self._ensure_label_slots(copy.deepcopy(self.current_plant_labels), len(preview_polygons))
+        final_polygons = []
+        final_labels = []
+
+        for index, polygon in enumerate(preview_polygons):
+            normalized_polygon = copy.deepcopy(polygon)
+            if self._get_polygon_area(normalized_polygon) > 0:
+                normalized_polygon = normalized_polygon[::-1]
+            final_polygons.append(normalized_polygon)
+            final_labels.append(self._label_for_index(preview_labels, index))
+
+        normalized_removals = normalize_polygons(copy.deepcopy(self.removal_regions))
+        for removal_polygon in normalized_removals:
+            removal_copy = copy.deepcopy(removal_polygon)
+            if self._get_polygon_area(removal_copy) < 0:
+                removal_copy = removal_copy[::-1]
+
+            x_coords = [point[0] for point in removal_copy]
+            y_coords = [point[1] for point in removal_copy]
+            center_point = (sum(x_coords) / len(x_coords), sum(y_coords) / len(y_coords))
+
+            for outer_contour in final_polygons:
+                if self._get_polygon_area(outer_contour) > 0:
+                    continue
+                if not self._point_in_polygon(center_point, outer_contour):
+                    continue
+                intersection_poly = self._polygon_intersection(outer_contour, removal_copy)
+                if not intersection_poly or len(intersection_poly) < 3:
+                    continue
+                if self._get_polygon_area(intersection_poly) < 0:
+                    intersection_poly = intersection_poly[::-1]
+                final_polygons.append(intersection_poly)
+                break
+
+        return normalize_polygons(final_polygons), final_labels
+
+    def load_preview_from_formal_instance(self, plant):
+        preview_polygons, preview_labels, removal_regions = self._split_instance_polygons_for_preview(
+            plant.get("polygons", []),
+            plant.get("labels", []),
+        )
+        self.current_plant_polygons = preview_polygons
+        self.current_plant_labels = preview_labels
+        self.removal_regions = removal_regions
+        self.current_points = []
+        self.current_removal_points = []
+        self.current_snap_point = None
+        self.selected_entity_kind = None
+        self.selected_entity_id = None
+        return bool(preview_polygons or removal_regions)
+
+    def build_preview_formal_instance(self, instance_id=None, source="manual"):
+        final_polygons, final_labels = self._compose_preview_instance_data()
+        if not final_polygons:
+            return None
+
+        preview_id = instance_id if instance_id is not None else self.current_plant_id
+        instance = make_formal_instance(instance_id=preview_id, polygons=final_polygons, source=source)
+        instance["labels"] = final_labels
+        instance["confirmed"] = False
+        return instance
+
     def _find_plant_by_id(self, plant_id):
         for plant in self.plants:
             if int(plant.get("id", 0)) == int(plant_id):
@@ -293,8 +369,8 @@ class ImageLabel(QLabel):
         self.mode = "fine_tune"
         self.fine_tune_instance_id = instance_id
         self.vertex_drag_info = None  # 拖拽中的顶点信息
-        self.add_vertex_mode = False  # 确保退出添加顶点模式
-        self.delete_vertex_mode = False  # 确保退出删除顶点模式
+        self.add_vertex_mode = False
+        self.delete_vertex_mode = False
         self.update_display()
 
         main_win = self.get_main_window()
@@ -382,8 +458,8 @@ class ImageLabel(QLabel):
         self.fine_tune_instance_id = None
         self.dragging_vertex = None
         self.fine_tune_original_data = {}
-        self.add_vertex_mode = False  # 同时退出添加顶点模式
-        self.delete_vertex_mode = False  # 同时退出删除顶点模式
+        self.add_vertex_mode = False
+        self.delete_vertex_mode = False
         self.selected_entity_kind = None
         self.selected_entity_id = None
         self.update_display()
@@ -3859,36 +3935,7 @@ class ImageLabel(QLabel):
             self.save_current_polygon()
         if self.current_removal_points:
             self.save_current_removal_region()
-        if len(self.current_plant_polygons) == 0:
-            return False
-
-        final_polygons = []
-        final_labels = []
-        for i, poly in enumerate(self.current_plant_polygons):
-            if len(poly) < 3:
-                continue
-            if poly[0] != poly[-1]:
-                poly = poly + [poly[0]]
-            if self._get_polygon_area(poly) > 0:
-                poly = poly[::-1]
-            final_polygons.append(poly)
-            final_labels.append(self.current_plant_labels[i] if i < len(self.current_plant_labels) else "stem")
-
-        for removal_poly in self.removal_regions:
-            if len(removal_poly) < 3:
-                continue
-            removal_copy = removal_poly + [removal_poly[0]] if removal_poly[0] != removal_poly[-1] else removal_poly.copy()
-            x_coords = [p[0] for p in removal_copy]
-            y_coords = [p[1] for p in removal_copy]
-            center_point = (sum(x_coords) / len(x_coords), sum(y_coords) / len(y_coords))
-            for outer_contour in final_polygons:
-                if self._point_in_polygon(center_point, outer_contour):
-                    intersection_poly = self._polygon_intersection(outer_contour, removal_copy)
-                    if intersection_poly and len(intersection_poly) >= 3:
-                        if self._get_polygon_area(intersection_poly) < 0:
-                            intersection_poly = intersection_poly[::-1]
-                        final_polygons.append(intersection_poly)
-                    break
+        final_polygons, final_labels = self._compose_preview_instance_data()
 
         if not final_polygons:
             return False

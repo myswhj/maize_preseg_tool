@@ -48,6 +48,56 @@ class MainWindowAnnotationMixin:
             self.combo_label.setCurrentIndex(index)
         finally:
             self.combo_label.blockSignals(blocked)
+
+    def _has_active_preview_session(self):
+        return bool(
+            getattr(self, "_is_continuing_annotation", False)
+            or self.left_label.current_plant_polygons
+            or self.left_label.removal_regions
+            or self.left_label.current_points
+            or self.left_label.current_removal_points
+        )
+
+    def _reset_preview_annotation_buffers(self, clear_tracking=True):
+        self.left_label.current_plant_polygons = []
+        self.left_label.current_plant_labels = []
+        self.left_label.removal_regions = []
+        self.left_label.current_points = []
+        self.left_label.current_removal_points = []
+        self.left_label.current_snap_point = None
+        self.left_label.selected_plant_id = None
+        self.left_label.selected_entity_kind = None
+        self.left_label.selected_entity_id = None
+        if clear_tracking:
+            for attr_name in ("_original_plant_id", "_original_plant_snapshot"):
+                if hasattr(self.left_label, attr_name):
+                    delattr(self.left_label, attr_name)
+
+    def _restore_continue_annotation_snapshot(self):
+        snapshot = getattr(self.left_label, "_original_plant_snapshot", None)
+        plant_id = getattr(self.left_label, "_original_plant_id", None)
+        if snapshot:
+            self.left_label.plants = [
+                plant for plant in self.left_label.plants if int(plant.get("id", 0)) != int(snapshot.get("id", 0))
+            ]
+            self.left_label.plants.append(copy.deepcopy(snapshot))
+            self.left_label.plants.sort(key=lambda item: int(item.get("id", 0)))
+            plant_id = snapshot.get("id", plant_id)
+
+        self._is_continuing_annotation = False
+        if hasattr(self, "btn_continue_annotation"):
+            self.btn_continue_annotation.setText("继续标注选中植株")
+        self._reset_preview_annotation_buffers(clear_tracking=True)
+        if plant_id is not None:
+            self.left_label.select_entity("formal", plant_id)
+        else:
+            self.left_label.update_display()
+        self.update_plant_list()
+        self.sync_summary_view()
+        if hasattr(self, "refresh_properties_panel"):
+            self.refresh_properties_panel()
+        self.update_status_bar()
+
     def apply_selected_staging_label(self):
         selected_kind, staging = self.left_label.get_selected_entity()
         if selected_kind != "staging" or not staging:
@@ -234,19 +284,24 @@ class MainWindowAnnotationMixin:
         dialog.exec_()
 
     def save_current_polygon(self):
+        changed = False
         if self.ignoring_region:
             if self.left_label.save_current_ignored_region():
-                self.mark_annotation_changed()
-                self.update_status_bar()
+                changed = True
         elif self.left_label.removing_region:
             if self.left_label.save_current_removal_region():
-                self.mark_annotation_changed()
-                self.update_status_bar()
+                changed = True
         else:
             selected_label = self.combo_label.currentText()
             if self.left_label.save_current_polygon(label=selected_label):
-                self.mark_annotation_changed()
-                self.update_status_bar()
+                changed = True
+        if changed:
+            self.mark_annotation_changed()
+            self.sync_summary_view()
+            self.update_undo_redo_state()
+            if hasattr(self, "refresh_properties_panel"):
+                self.refresh_properties_panel()
+            self.update_status_bar()
         self._update_staging_controls()
 
     def save_plant(self):
@@ -285,12 +340,7 @@ class MainWindowAnnotationMixin:
                     if hasattr(self, "btn_continue_annotation"):
                         self.btn_continue_annotation.setText("继续标注选中植株")
 
-                    self.left_label.current_plant_polygons = []
-                    self.left_label.current_plant_labels = []
-                    self.left_label.removal_regions = []
-
-                    if hasattr(self.left_label, "_original_plant_id"):
-                        delattr(self.left_label, "_original_plant_id")
+                    self._reset_preview_annotation_buffers(clear_tracking=True)
 
                     self.left_label.update_display()
                     self.update_plant_list()
@@ -313,7 +363,12 @@ class MainWindowAnnotationMixin:
         """撤销临时绘制或实例级增减。"""
         if self.left_label.undo_last_action():
             self.mark_annotation_changed()
+            self.sync_summary_view()
+            self.update_plant_list()
             self.update_undo_redo_state()
+            if hasattr(self, "refresh_properties_panel"):
+                self.refresh_properties_panel()
+            self.update_status_bar()
             return
         if not self.undo_stack:
             return
@@ -344,7 +399,12 @@ class MainWindowAnnotationMixin:
         """重做操作。"""
         if self.left_label.redo_last_action():
             self.mark_annotation_changed()
+            self.sync_summary_view()
+            self.update_plant_list()
             self.update_undo_redo_state()
+            if hasattr(self, "refresh_properties_panel"):
+                self.refresh_properties_panel()
+            self.update_status_bar()
             return
         if not self.redo_stack:
             return
@@ -407,94 +467,70 @@ class MainWindowAnnotationMixin:
             self.update_status_bar()
 
     def continue_annotation(self):
-        """继续标注选中的植株或结束标注。"""
-        if hasattr(self, "_is_continuing_annotation") and self._is_continuing_annotation:
-            has_changes = bool(self.left_label.current_plant_polygons)
+        """继续标注选中的植株，或结束当前继续标注会话。"""
+        if self.left_label.mode == "fine_tune":
+            QMessageBox.warning(self, "警告", "请先退出当前微调模式，再继续标注植株")
+            return
 
-            if has_changes:
-                reply = QMessageBox.question(
-                    self,
-                    "未保存的修改",
-                    "您有未保存的修改，是否保存？",
-                    QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-                    QMessageBox.Yes,
-                )
-
-                if reply == QMessageBox.Cancel:
-                    return
-                if reply == QMessageBox.Yes:
-                    self.save_plant()
-
-            self._is_continuing_annotation = False
-            self.btn_continue_annotation.setText("继续标注选中植株")
-
-            self.left_label.current_plant_polygons = []
-            self.left_label.current_plant_labels = []
-            self.left_label.removal_regions = []
-
-            if hasattr(self.left_label, "_original_plant_id"):
-                delattr(self.left_label, "_original_plant_id")
-
-            self.left_label.selected_plant_id = None
-
-            self.left_label.update_display()
-            self.update_plant_list()
-            self.sync_summary_view()
-        else:
-            if hasattr(self, "current_image_state"):
-                if self.current_image_state.get("annotation_completed", False):
-                    reply = QMessageBox.question(
-                        self,
-                        "图片已完成标注",
-                        "此图片已标记为完成标注。是否取消已完成状态并继续标注？",
-                        QMessageBox.Yes | QMessageBox.No,
-                        QMessageBox.No,
-                    )
-                    if reply == QMessageBox.No:
-                        return
-                    self.current_image_state["annotation_completed"] = False
-                    self.mark_annotation_changed()
-                    self.update_status_bar()
-
-            if not hasattr(self, "combo_plants") or self.combo_plants.currentIndex() == -1:
+        if getattr(self, "_is_continuing_annotation", False):
+            reply = QMessageBox.question(
+                self,
+                "结束继续标注",
+                "当前植株仍在继续标注中。是否保存当前修改？",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Cancel:
+                return
+            if reply == QMessageBox.Yes:
+                self.save_plant()
                 return
 
-            selected_plant_id = self.combo_plants.currentData()
-            if selected_plant_id is None:
+            self._restore_continue_annotation_snapshot()
+            return
+
+        if hasattr(self, "current_image_state") and self.current_image_state.get("annotation_completed", False):
+            reply = QMessageBox.question(
+                self,
+                "图片已完成标注",
+                "此图片已标记为完成标注。是否取消完成状态并继续标注？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply == QMessageBox.No:
                 return
-
-            selected_plant = None
-            for plant in self.left_label.plants:
-                if plant.get("id") == selected_plant_id:
-                    selected_plant = plant
-                    break
-
-            if not selected_plant:
-                return
-
-            original_plant_id = selected_plant_id
-
-            self.left_label.current_plant_polygons = []
-            self.left_label.current_plant_labels = []
-            self.left_label.removal_regions = []
-
-            labels = selected_plant.get("labels", [])
-            for index, polygon in enumerate(selected_plant.get("polygons", [])):
-                self.left_label.current_plant_polygons.append(polygon)
-                if index < len(labels):
-                    self.left_label.current_plant_labels.append(labels[index])
-                else:
-                    self.left_label.current_plant_labels.append("stem")
-
-            self.left_label.plants = [plant for plant in self.left_label.plants if plant.get("id") != selected_plant_id]
-            self.left_label._original_plant_id = original_plant_id
-
-            self._is_continuing_annotation = True
-            self.btn_continue_annotation.setText("结束标注该植株")
-
-            self.left_label.update_display()
-            self.sync_summary_view()
+            self.current_image_state["annotation_completed"] = False
             self.mark_annotation_changed()
+            self.update_status_bar()
+
+        if not hasattr(self, "combo_plants") or self.combo_plants.currentIndex() == -1:
+            return
+
+        selected_plant_id = self.combo_plants.currentData()
+        if selected_plant_id is None:
+            return
+
+        selected_plant = None
+        for plant in self.left_label.plants:
+            if plant.get("id") == selected_plant_id:
+                selected_plant = plant
+                break
+
+        if not selected_plant:
+            return
+
+        self._reset_preview_annotation_buffers(clear_tracking=False)
+        self.left_label.load_preview_from_formal_instance(selected_plant)
+        self.left_label.plants = [plant for plant in self.left_label.plants if plant.get("id") != selected_plant_id]
+        self.left_label._original_plant_id = selected_plant_id
+        self.left_label._original_plant_snapshot = copy.deepcopy(selected_plant)
+
+        self._is_continuing_annotation = True
+        self.btn_continue_annotation.setText("结束标注该植株")
+
+        self.left_label.update_display()
+        self.sync_summary_view()
+        self.mark_annotation_changed()
 
     def toggle_add_vertex_mode(self):
         """切换添加顶点模式。"""
@@ -534,6 +570,10 @@ class MainWindowAnnotationMixin:
             if self.left_label.candidate_instances:
                 QMessageBox.warning(self, "警告", "请先接受或拒绝当前预标注候选，再进行微调")
                 return
+
+        if self.left_label.mode != "fine_tune" and self._has_active_preview_session():
+            QMessageBox.warning(self, "警告", "请先完成或取消当前继续标注/暂存编辑，再进入微调模式")
+            return
 
         if self.left_label.mode == "fine_tune":
             exited = self.left_label.exit_fine_tune_mode()
@@ -606,6 +646,12 @@ class MainWindowAnnotationMixin:
 
         plants = copy.deepcopy(self.left_label.plants)
         ignored_regions = copy.deepcopy(self.left_label.ignored_regions)
+        preview_instance_id = getattr(self.left_label, "_original_plant_id", None) or self.left_label.current_plant_id
+        preview_instance = self.left_label.build_preview_formal_instance(instance_id=preview_instance_id)
+        if preview_instance:
+            plants = [plant for plant in plants if int(plant.get("id", 0)) != int(preview_instance.get("id", 0))]
+            plants.append(preview_instance)
+            plants.sort(key=lambda item: int(item.get("id", 0)))
 
         self.right_label.set_annotation_state(
             plants,
