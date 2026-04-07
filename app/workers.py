@@ -8,17 +8,19 @@ class SamTrainingWorker(QThread):
 
     finished_signal = pyqtSignal(bool, str, str)
 
-    def __init__(self, training_manager, coco_container, image_paths):
+    def __init__(self, training_manager, coco_container, image_paths, train_kwargs=None):
         super().__init__()
         self.training_manager = training_manager
         self.coco_container = copy.deepcopy(coco_container)
         self.image_paths = list(image_paths or [])
+        self.train_kwargs = dict(train_kwargs or {})
 
     def run(self):
         try:
             best_model_path = self.training_manager.train(
                 self.coco_container,
                 self.image_paths,
+                **self.train_kwargs,
             )
             success = True
             message = f"训练完成，最佳模型已保存到: {best_model_path}"

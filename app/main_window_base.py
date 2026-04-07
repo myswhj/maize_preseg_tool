@@ -1,6 +1,7 @@
 import os
+from time import monotonic
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QKeySequence, QPalette
 from PyQt5.QtWidgets import (
     QApplication,
@@ -21,7 +22,11 @@ from components.toolbars import _apply_toolbar_button_accents
 from models.sam_manager import SamManager
 from services.sam_training_manager import SamTrainingManagerV2
 from ui.annotation_properties_panel import AnnotationPropertiesPanel
-from utils.annotation_schema import make_image_state
+from utils.annotation_schema import (
+    format_elapsed_seconds,
+    make_image_state,
+    normalize_annotation_timing_state,
+)
 from utils.interaction_state import InteractionStateMachine
 
 
@@ -65,6 +70,11 @@ class MainWindowBase(QMainWindow):
         self.preannotation_record_counter = 1
         self.preannotation_fine_tune_sessions = {}
         self.interaction_state_machine = InteractionStateMachine()
+        self.annotation_timer = QTimer(self)
+        self.annotation_timer.setInterval(1000)
+        self.annotation_timer.timeout.connect(self.update_timing_panel)
+        self._timer_running = False
+        self._timer_started_monotonic = None
 
         self.apply_window_theme()
         self.init_ui()
@@ -230,6 +240,7 @@ class MainWindowBase(QMainWindow):
             ("btn_save_plant", "primary"),
             ("btn_sam_train", "primary"),
             ("btn_sam_preannotate", "primary"),
+            ("btn_timer_start", "primary"),
             ("btn_delete", "danger"),
             ("btn_delete_staging_polygon", "danger"),
             ("btn_removal_region", "danger"),
@@ -237,6 +248,7 @@ class MainWindowBase(QMainWindow):
             ("btn_toggle_annotation", "muted"),
             ("btn_prev", "muted"),
             ("btn_next", "muted"),
+            ("btn_timer_pause", "muted"),
             ("btn_toggle_projection", "muted"),
             ("btn_help", "muted"),
             ("btn_debug_coco", "muted"),
@@ -288,6 +300,7 @@ class MainWindowBase(QMainWindow):
         left_layout.addWidget(Toolbars.create_annotation_toolbar(self))
         left_layout.addWidget(Toolbars.create_plant_management_toolbar(self))
         left_layout.addWidget(Toolbars.create_navigation_toolbar(self))
+        left_layout.addWidget(Toolbars.create_timing_toolbar(self))
         left_layout.addWidget(Toolbars.create_progress_label(self))
         left_layout.addStretch()
         left_scroll = self.create_scroll_panel(left_panel, min_width=220, preferred_width=260)
@@ -386,6 +399,10 @@ class MainWindowBase(QMainWindow):
             self.btn_prev.setText(f"上一张 ({SHORTCUTS['PREV_IMAGE']})")
         if hasattr(self, "btn_next"):
             self.btn_next.setText(f"下一张 ({SHORTCUTS['NEXT_IMAGE']})")
+        if hasattr(self, "btn_timer_start"):
+            self.btn_timer_start.setText("开始/继续计时")
+        if hasattr(self, "btn_timer_pause"):
+            self.btn_timer_pause.setText("暂停计时")
         if hasattr(self, "btn_delete"):
             self.btn_delete.setText(f"删除选中植株 ({SHORTCUTS['DELETE_PLANT']})")
         if hasattr(self, "btn_delete_staging_polygon"):
@@ -430,6 +447,94 @@ class MainWindowBase(QMainWindow):
             self.btn_select_weights.setText("选择权重")
         if hasattr(self, "properties_panel"):
             self.properties_panel.restore_button_texts()
+        self.update_timing_panel()
+
+    def _get_timing_state(self):
+        if not self.current_image_state:
+            self.current_image_state = make_image_state(self.current_image_path or "")
+        timing_state = normalize_annotation_timing_state(self.current_image_state.get("annotation_timing"))
+        self.current_image_state["annotation_timing"] = timing_state
+        return timing_state
+
+    def _get_live_timing_totals(self):
+        timing_state = self._get_timing_state()
+        total_seconds = float(timing_state.get("total_seconds", 0.0))
+        manual_seconds = float(timing_state.get("manual_seconds", 0.0))
+        sam_seconds = float(timing_state.get("sam_seconds", 0.0))
+
+        if self._timer_running and self._timer_started_monotonic is not None:
+            delta = max(0.0, monotonic() - self._timer_started_monotonic)
+            total_seconds += delta
+            if timing_state.get("active_mode") == "sam":
+                sam_seconds += delta
+            else:
+                manual_seconds += delta
+
+        return total_seconds, manual_seconds, sam_seconds
+
+    def _commit_annotation_timer_segment(self, reason="pause"):
+        if not self._timer_running or self._timer_started_monotonic is None:
+            return 0.0
+
+        elapsed = max(0.0, monotonic() - self._timer_started_monotonic)
+        timing_state = self._get_timing_state()
+        timing_state["total_seconds"] = float(timing_state.get("total_seconds", 0.0)) + elapsed
+        timing_state["manual_seconds"] = float(timing_state.get("manual_seconds", 0.0)) + elapsed
+        timing_state.setdefault("sessions", []).append(
+            {
+                "mode": "annotation",
+                "started_at_monotonic": None,
+                "ended_reason": reason,
+                "elapsed_seconds": round(elapsed, 3),
+                "recorded_at": self.current_image_state.get("last_modified_at"),
+            }
+        )
+        self._timer_running = False
+        self._timer_started_monotonic = None
+        return elapsed
+
+    def start_annotation_timer(self):
+        if not self.current_image_path:
+            return
+        if self.current_image_state.get("annotation_completed", False):
+            return
+        self._get_timing_state()
+        if self._timer_running:
+            return
+        self._timer_running = True
+        self._timer_started_monotonic = monotonic()
+        if not self.annotation_timer.isActive():
+            self.annotation_timer.start()
+        self.update_timing_panel()
+
+    def pause_annotation_timer(self):
+        self._commit_annotation_timer_segment(reason="pause")
+        self.annotation_timer.stop()
+        self.update_timing_panel()
+
+    def update_timing_panel(self):
+        if not hasattr(self, "label_timing_total"):
+            return
+
+        if not self.current_image_path:
+            if hasattr(self, "label_timing_status"):
+                self.label_timing_status.setText("状态: 未加载图片")
+            self.label_timing_total.setText("总耗时: 00:00:00")
+            return
+
+        timing_state = self._get_timing_state()
+        total_seconds, _, _ = self._get_live_timing_totals()
+        if self.current_image_state.get("annotation_completed"):
+            running_label = "已完成"
+        else:
+            running_label = "计时中" if self._timer_running else "已暂停"
+        self.label_timing_status.setText(f"状态: {running_label}")
+        self.label_timing_total.setText(f"总耗时: {format_elapsed_seconds(total_seconds)}")
+
+        if hasattr(self, "btn_timer_pause"):
+            self.btn_timer_pause.setEnabled(self._timer_running)
+        if hasattr(self, "update_status_bar"):
+            self.update_status_bar()
 
     def restore_button_visuals(self):
         """训练异常后强制刷新按钮调色板和重绘，避免按钮文字可见性丢失。"""

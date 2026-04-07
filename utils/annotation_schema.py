@@ -95,7 +95,45 @@ def make_image_state(image_path, annotation_completed=False):
         "last_modified_at": current_timestamp(),
         "last_trained_seen_hash": None,
         "dirty_since_last_train": bool(annotation_completed),
+        "annotation_timing": make_annotation_timing_state(),
     }
+
+
+def make_annotation_timing_state():
+    return {
+        "total_seconds": 0.0,
+        "manual_seconds": 0.0,
+        "sam_seconds": 0.0,
+        "used_sam_preannotation": False,
+        "active_mode": "manual",
+        "sessions": [],
+    }
+
+
+def normalize_annotation_timing_state(timing_state):
+    state = copy.deepcopy(timing_state or {})
+    if not state:
+        return make_annotation_timing_state()
+
+    state.setdefault("total_seconds", 0.0)
+    state.setdefault("manual_seconds", 0.0)
+    state.setdefault("sam_seconds", 0.0)
+    state.setdefault("used_sam_preannotation", False)
+    state.setdefault("active_mode", "manual")
+    state.setdefault("sessions", [])
+
+    if state.get("active_mode") not in ("manual", "sam"):
+        state["active_mode"] = "manual"
+    if not isinstance(state.get("sessions"), list):
+        state["sessions"] = []
+    return state
+
+
+def format_elapsed_seconds(total_seconds):
+    total_seconds = max(0, int(round(float(total_seconds or 0))))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def make_formal_instance(
@@ -194,6 +232,7 @@ def normalize_image_state(image_path, image_state):
     state.setdefault("last_modified_at", current_timestamp())
     state.setdefault("last_trained_seen_hash", None)
     state.setdefault("dirty_since_last_train", bool(state.get("annotation_completed", False)))
+    state["annotation_timing"] = normalize_annotation_timing_state(state.get("annotation_timing"))
     return state
 
 

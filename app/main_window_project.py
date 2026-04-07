@@ -4,7 +4,7 @@ import traceback
 from PyQt5.QtWidgets import QFileDialog, QMessageBox
 
 from config import SHORTCUTS
-from utils.annotation_schema import current_timestamp, make_image_state
+from utils.annotation_schema import current_timestamp, make_image_state, normalize_image_state
 from utils.data_manager import load_annotation_from_coco
 from utils.helpers import load_image
 from utils.image_processor import preprocess_image
@@ -27,6 +27,15 @@ class MainWindowProjectMixin:
         self.annotation_changed = True
         if self.current_image_state:
             self.current_image_state["last_modified_at"] = current_timestamp()
+            timing_state = self.current_image_state.get("annotation_timing", {})
+            total_seconds = float(timing_state.get("total_seconds", 0.0) or 0.0)
+            if (
+                self.current_image_path
+                and not self.current_image_state.get("annotation_completed", False)
+                and total_seconds <= 0.0
+                and hasattr(self, "start_annotation_timer")
+            ):
+                self.start_annotation_timer()
         if self.current_image_path:
             if hasattr(self, "_save_preannotation_adjustment_records"):
                 self._save_preannotation_adjustment_records(self.current_image_path)
@@ -69,6 +78,8 @@ class MainWindowProjectMixin:
         self.image_sequence_map = {path: index for index, path in enumerate(self.image_paths, start=1)}
         self.preprocess_cache.clear()
         self.coco_container.clear()
+        if hasattr(self, "pause_annotation_timer"):
+            self.pause_annotation_timer()
         self.preannotation_adjustment_records = []
         self.preannotation_record_counter = 1
         self.preannotation_fine_tune_sessions = {}
@@ -90,6 +101,9 @@ class MainWindowProjectMixin:
             return
 
         if self.current_image_path:
+            if hasattr(self, "_commit_annotation_timer_segment"):
+                self._commit_annotation_timer_segment(reason="image_switch")
+                self.annotation_timer.stop()
             if hasattr(self, "_save_preannotation_adjustment_records"):
                 self._save_preannotation_adjustment_records(self.current_image_path)
             annotation_state = self.left_label.get_annotation_state()
@@ -130,6 +144,8 @@ class MainWindowProjectMixin:
             self.clear_annotation_changed()
             self.update_plant_list()
             self.sync_summary_view()
+            if hasattr(self, "update_timing_panel"):
+                self.update_timing_panel()
             self.update_status_bar()
             if hasattr(self, "sync_interaction_state"):
                 self.sync_interaction_state()
@@ -159,12 +175,18 @@ class MainWindowProjectMixin:
                 current_plant_id=annotation.get("current_plant_id", 1),
             )
             self.left_label.ignored_regions = annotation.get("ignored_regions", [])
-            self.current_image_state = annotation.get("image_state", make_image_state(self.current_image_path))
+            self.current_image_state = normalize_image_state(
+                self.current_image_path,
+                annotation.get("image_state", make_image_state(self.current_image_path)),
+            )
             self.current_annotation_hash = annotation.get("annotation_hash")
         else:
             self.left_label.set_annotation_state([], current_plant_id=1)
             self.left_label.ignored_regions = []
-            self.current_image_state = make_image_state(self.current_image_path, annotation_completed=False)
+            self.current_image_state = normalize_image_state(
+                self.current_image_path,
+                make_image_state(self.current_image_path, annotation_completed=False),
+            )
             self.current_annotation_hash = None
 
     def prev_image(self):
@@ -182,6 +204,8 @@ class MainWindowProjectMixin:
         self.current_image_state["annotation_completed"] = True
         self.current_image_state["dirty_since_last_train"] = True
         self.mark_annotation_changed()
+        if hasattr(self, "pause_annotation_timer"):
+            self.pause_annotation_timer()
         if hasattr(self, "_save_preannotation_adjustment_records"):
             self._save_preannotation_adjustment_records(self.current_image_path)
         QMessageBox.information(self, "状态更新", "当前图片已标记为已完成")

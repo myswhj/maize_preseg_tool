@@ -2,10 +2,10 @@
 from PyQt5.QtWidgets import (
     QComboBox,
     QGroupBox,
-    QVBoxLayout,
     QLabel,
     QPushButton,
     QTextEdit,
+    QVBoxLayout,
 )
 
 from config import SHORTCUTS
@@ -17,8 +17,6 @@ class NoWheelComboBox(QComboBox):
 
 
 class Toolbars:
-    """工具栏组件管理。"""
-
     @staticmethod
     def create_file_toolbar(parent):
         file_group = QGroupBox("文件操作")
@@ -28,7 +26,6 @@ class Toolbars:
         parent.btn_load_batch = QPushButton(f"批量加载图片 ({SHORTCUTS['LOAD_BATCH']})")
         parent.btn_load_batch.clicked.connect(parent.load_batch_images)
         file_layout.addWidget(parent.btn_load_batch)
-
         return file_group
 
     @staticmethod
@@ -54,8 +51,28 @@ class Toolbars:
         parent.btn_next.clicked.connect(parent.next_image)
         parent.btn_next.setEnabled(False)
         nav_layout.addWidget(parent.btn_next)
-
         return nav_group
+
+    @staticmethod
+    def create_timing_toolbar(parent):
+        timing_group = QGroupBox("标注计时")
+        timing_layout = QVBoxLayout()
+        timing_group.setLayout(timing_layout)
+
+        parent.label_timing_status = QLabel("状态: 未开始")
+        timing_layout.addWidget(parent.label_timing_status)
+
+        parent.label_timing_total = QLabel("总耗时: 00:00:00")
+        timing_layout.addWidget(parent.label_timing_total)
+
+        parent.btn_timer_start = QPushButton("开始/继续计时")
+        parent.btn_timer_start.clicked.connect(parent.start_annotation_timer)
+        timing_layout.addWidget(parent.btn_timer_start)
+
+        parent.btn_timer_pause = QPushButton("暂停计时")
+        parent.btn_timer_pause.clicked.connect(parent.pause_annotation_timer)
+        timing_layout.addWidget(parent.btn_timer_pause)
+        return timing_group
 
     @staticmethod
     def create_annotation_toolbar(parent):
@@ -88,7 +105,6 @@ class Toolbars:
         parent.btn_redo = QPushButton(f"重做 ({SHORTCUTS['REDO']})")
         parent.btn_redo.clicked.connect(parent.redo)
         annotate_layout.addWidget(parent.btn_redo)
-
         return annotate_group
 
     @staticmethod
@@ -116,7 +132,6 @@ class Toolbars:
         parent.btn_clear_all_ignore = QPushButton("清除所有忽略区域")
         parent.btn_clear_all_ignore.clicked.connect(parent.clear_all_ignore_regions)
         aux_func_layout.addWidget(parent.btn_clear_all_ignore)
-
         return aux_func_group
 
     @staticmethod
@@ -157,13 +172,13 @@ class Toolbars:
         plant_layout.addWidget(parent.btn_apply_staging_label)
 
         parent.btn_delete_staging_polygon = QPushButton(
-            f"删除选中的区域/去除区域 ({SHORTCUTS['DELETE_STAGING_POLYGON']})"
+            f"删除选中区域/去除区域 ({SHORTCUTS['DELETE_STAGING_POLYGON']})"
         )
         parent.btn_delete_staging_polygon.clicked.connect(parent.delete_selected_staging_polygon)
         parent.btn_delete_staging_polygon.setEnabled(False)
         plant_layout.addWidget(parent.btn_delete_staging_polygon)
 
-        parent.btn_split_staging_polygon = QPushButton("切割选中暂存区域")
+        parent.btn_split_staging_polygon = QPushButton("切分选中暂存区域")
         parent.btn_split_staging_polygon.clicked.connect(parent.toggle_split_staging_polygon)
         parent.btn_split_staging_polygon.setEnabled(False)
         plant_layout.addWidget(parent.btn_split_staging_polygon)
@@ -171,7 +186,6 @@ class Toolbars:
         parent.btn_undo_delete = QPushButton("撤销删除植株")
         parent.btn_undo_delete.clicked.connect(parent.undo_delete_plant)
         plant_layout.addWidget(parent.btn_undo_delete)
-
         return plant_group
 
     @staticmethod
@@ -187,7 +201,6 @@ class Toolbars:
         parent.btn_export_annotated = QPushButton("批量导出已完成(coco格式)")
         parent.btn_export_annotated.clicked.connect(parent.export_annotated_images)
         export_layout.addWidget(parent.btn_export_annotated)
-
         return export_group
 
     @staticmethod
@@ -227,7 +240,6 @@ class Toolbars:
         parent.sam_info_text.setMinimumHeight(60)
         parent.sam_info_text.setPlaceholderText("SAM 信息将显示在这里...")
         sam_layout.addWidget(parent.sam_info_text)
-
         return sam_group
 
     @staticmethod
@@ -243,7 +255,6 @@ class Toolbars:
         parent.btn_debug_coco = QPushButton("调试COCO容器")
         parent.btn_debug_coco.clicked.connect(parent.debug_print_coco_container)
         aux_layout.addWidget(parent.btn_debug_coco)
-
         return aux_group
 
     @staticmethod
@@ -268,6 +279,7 @@ def _apply_toolbar_button_accents(parent):
         ("btn_toggle_projection", "muted"),
         ("btn_help", "muted"),
         ("btn_debug_coco", "muted"),
+        ("btn_timer_pause", "muted"),
     ):
         button = getattr(parent, button_name, None)
         if button is None:

@@ -1,10 +1,11 @@
 import copy
 import os
 
-from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtWidgets import QInputDialog, QMessageBox
 
 from components.help_dialog import HelpDialog
 from config import SHORTCUTS
+from utils.annotation_schema import format_elapsed_seconds
 
 
 class MainWindowAnnotationMixin:
@@ -17,13 +18,14 @@ class MainWindowAnnotationMixin:
         has_staging = in_fine_tune and (not vertex_mode_active) and selected_kind == "staging"
         has_removal = (not vertex_mode_active) and selected_kind == "removal"
         can_delete_area = has_staging or has_removal
+        can_split_staging = in_fine_tune and has_staging
 
         if hasattr(self, "btn_apply_staging_label"):
             self.btn_apply_staging_label.setEnabled(has_staging)
         if hasattr(self, "btn_delete_staging_polygon"):
             self.btn_delete_staging_polygon.setEnabled(can_delete_area)
         if hasattr(self, "btn_split_staging_polygon"):
-            self.btn_split_staging_polygon.setEnabled(has_staging)
+            self.btn_split_staging_polygon.setEnabled(can_split_staging)
             self.btn_split_staging_polygon.setText(
                 "退出切割暂存区域" if self.left_label.split_staging_mode else "切割选中暂存区域"
             )
@@ -99,12 +101,33 @@ class MainWindowAnnotationMixin:
         self.update_status_bar()
 
     def apply_selected_staging_label(self):
+        if self.left_label.mode != "fine_tune":
+            QMessageBox.warning(self, "警告", "修改暂存区域标签仅可在微调模式下使用")
+            return
         selected_kind, staging = self.left_label.get_selected_entity()
         if selected_kind != "staging" or not staging:
             QMessageBox.warning(self, "警告", "请先选中一个暂存区域")
             return
 
-        selected_label = self.combo_label.currentText().strip()
+        label_options = []
+        if hasattr(self, "combo_label"):
+            label_options = [self.combo_label.itemText(index).strip() for index in range(self.combo_label.count())]
+            label_options = [label for label in label_options if label]
+        current_label = (staging.get("label") or "").strip() or (label_options[0] if label_options else "stem")
+        if current_label not in label_options:
+            label_options.insert(0, current_label)
+
+        selected_label, ok = QInputDialog.getItem(
+            self,
+            "修改暂存区域标签",
+            "请选择该暂存区域的新标签:",
+            label_options or [current_label],
+            max(0, (label_options or [current_label]).index(current_label)),
+            False,
+        )
+        if not ok:
+            return
+        selected_label = selected_label.strip()
         if not selected_label:
             QMessageBox.warning(self, "警告", "当前没有可用标签")
             return
@@ -119,6 +142,10 @@ class MainWindowAnnotationMixin:
         self.update_undo_redo_state()
         if hasattr(self, "refresh_properties_panel"):
             self.refresh_properties_panel()
+        if hasattr(self, "combo_label"):
+            label_index = self.combo_label.findText(selected_label)
+            if label_index >= 0:
+                self.combo_label.setCurrentIndex(label_index)
         self.sync_label_combo_with_selection()
         self._update_staging_controls()
         self.update_status_bar()
@@ -213,10 +240,20 @@ class MainWindowAnnotationMixin:
             QMessageBox.warning(self, "警告", "请先加载图片")
             return
 
-        has_unsaved_points = False
-        message = ""
+        if self.left_label.preannotation_box_mode:
+            QMessageBox.warning(self, "警告", "请先完成或取消当前框选预标注，再切换去除区域模式")
+            return
 
-        if not self.left_label.removing_region:
+        if getattr(self.left_label, "candidate_instances", None):
+            if self.left_label.candidate_instances:
+                QMessageBox.warning(self, "警告", "请先接受或拒绝当前预标注候选，再切换去除区域模式")
+                return
+
+        entering_mode = not self.left_label.removing_region
+
+        if entering_mode:
+            has_unsaved_points = False
+            message = ""
             if self.left_label.current_points:
                 has_unsaved_points = True
                 message = "当前有未保存的标注点"
@@ -240,9 +277,23 @@ class MainWindowAnnotationMixin:
                     elif self.left_label.current_ignored_points:
                         self.left_label.current_ignored_points = []
                     self.left_label.current_snap_point = None
-                    self.left_label.update_display()
+        elif self.left_label.current_removal_points:
+            reply = QMessageBox.question(
+                self,
+                "未保存的去除区域",
+                "当前有未保存的去除区域点，是否丢弃并退出去除区域模式？",
+                QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if reply == QMessageBox.Cancel:
+                return
+            self.left_label.current_removal_points = []
+            self.left_label.current_snap_point = None
+            if self.left_label.selected_entity_kind == "removal" and not self.left_label.removal_regions:
+                self.left_label.selected_entity_kind = None
+                self.left_label.selected_entity_id = None
 
-        self.left_label.removing_region = not self.left_label.removing_region
+        self.left_label.removing_region = entering_mode
         if self.left_label.removing_region:
             self.btn_removal_region.setText("退出去除区域 (R)")
             self.left_label.ignoring_region = False
@@ -260,6 +311,14 @@ class MainWindowAnnotationMixin:
         else:
             self.btn_removal_region.setText("去除区域 (R)")
             self.left_label.removing_region = False
+            self.left_label.current_removal_points = []
+            self.left_label.current_snap_point = None
+
+        self.left_label.update_display()
+        if hasattr(self, "sync_interaction_state"):
+            self.sync_interaction_state()
+        self._update_staging_controls()
+        self.update_status_bar()
 
     def toggle_projection(self):
         """切换投影框显示。"""
@@ -721,6 +780,10 @@ class MainWindowAnnotationMixin:
             status_parts.append("框选预标注模式")
         elif self.left_label.candidate_instances:
             status_parts.append("存在待处理预标注候选")
+
+        if hasattr(self, "_get_live_timing_totals") and self.current_image_path:
+            total_seconds, _, _ = self._get_live_timing_totals()
+            status_parts.append(f"计时:{format_elapsed_seconds(total_seconds)}")
 
         state_name = getattr(self.interaction_state_machine, "state", None)
         if state_name == "preannotation_box":

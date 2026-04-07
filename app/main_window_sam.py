@@ -1,11 +1,18 @@
 import copy
 import json
 import os
+from pathlib import Path
 import shutil
 
 from PyQt5.QtWidgets import QFileDialog, QInputDialog, QMessageBox
 
-from utils.annotation_schema import current_timestamp, make_formal_instance
+from utils.annotation_schema import compute_annotation_hash, current_timestamp, make_formal_instance
+from utils.project_context import (
+    ensure_project_for_images,
+    mark_training_failed,
+    mark_training_started,
+    mark_training_success,
+)
 
 from .workers import SamTrainingWorker
 
@@ -78,81 +85,6 @@ class MainWindowSamMixin:
         except Exception as error:
             self.sam_info_text.append(f"加载失败: {str(error)}")
             QMessageBox.warning(self, "失败", f"加载SAM模型失败: {str(error)}")
-
-    def start_sam_training(self):
-        """开始SAM训练"""
-        if self.sam_training_worker and self.sam_training_worker.isRunning():
-            QMessageBox.information(self, "提示", "SAM训练正在进行中")
-            return
-
-        if not self.sam_manager.has_model_loaded():
-            QMessageBox.warning(self, "警告", "请先加载SAM模型")
-            return
-
-        if self.left_label.mode == "fine_tune":
-            QMessageBox.warning(self, "警告", "请先退出当前微调模式，再执行框选预标注")
-            return
-
-        self.sam_info_text.append(f"COCO容器大小: {len(self.coco_container)}")
-        for image_path, annotation in self.coco_container.items():
-            image_state = annotation.get("image_state", {})
-            completed = image_state.get("annotation_completed", False)
-            self.sam_info_text.append(f"图片: {os.path.basename(image_path)}, 已完成: {completed}")
-
-        completed_count = sum(
-            1
-            for ann in self.coco_container.values()
-            if ann.get("image_state", {}).get("annotation_completed", False)
-        )
-        self.sam_info_text.append(f"已完成图片数量: {completed_count}")
-
-        if completed_count <= 0:
-            QMessageBox.warning(self, "警告", "当前项目还没有已完成图片，无法开始训练")
-            return
-
-        if not self.image_paths:
-            QMessageBox.warning(self, "警告", "请先加载图片")
-            return
-
-        self.sam_info_text.append("开始训练...")
-        self.btn_load_sam.setEnabled(False)
-        self.btn_sam_train.setEnabled(False)
-        self.btn_sam_train.setText("训练中...")
-        self.btn_sam_preannotate.setEnabled(False)
-
-        self.sam_training_worker = SamTrainingWorker(
-            self.sam_training_manager,
-            self.coco_container,
-            self.image_paths,
-        )
-        self.sam_training_worker.finished_signal.connect(self._handle_sam_training_finished)
-        self.sam_training_worker.finished.connect(self._cleanup_sam_training_worker)
-        self.sam_training_worker.start()
-
-    def _handle_sam_training_finished(self, success, message, best_model_path):
-        """处理后台训练完成回调。"""
-        self.btn_load_sam.setEnabled(True)
-        self.btn_sam_train.setEnabled(True)
-        self.btn_sam_train.setText("开始训练")
-        self.btn_sam_preannotate.setEnabled(True)
-        if success:
-            export_path, _ = QFileDialog.getSaveFileName(
-                self,
-                "保存训练后的模型",
-                os.path.basename(best_model_path) if best_model_path else "sam_model_best.pth",
-                "PyTorch Model (*.pth)",
-            )
-            if export_path:
-                shutil.copy2(best_model_path, export_path)
-                self.sam_info_text.append(f"模型已另存为: {export_path}")
-                message = f"{message}\n\n另存为: {export_path}"
-            else:
-                self.sam_info_text.append(f"未另存模型，保留默认路径: {best_model_path}")
-            self.sam_info_text.append("训练完成")
-            QMessageBox.information(self, "训练完成", message)
-        else:
-            self.sam_info_text.append(f"训练失败: {message}")
-            QMessageBox.warning(self, "训练失败", message)
 
     def _cleanup_sam_training_worker(self):
         """释放训练线程引用。"""
@@ -356,6 +288,9 @@ class MainWindowSamMixin:
             self._update_preannotation_controls()
             return
 
+        if hasattr(self, "mark_sam_timing_used"):
+            self.mark_sam_timing_used(auto_start=True)
+
         if self.left_label.candidate_instances:
             reply = QMessageBox.question(
                 self,
@@ -380,6 +315,9 @@ class MainWindowSamMixin:
         if not candidate:
             QMessageBox.warning(self, "警告", "请先选择一个预标注候选")
             return
+
+        if hasattr(self, "mark_sam_timing_used"):
+            self.mark_sam_timing_used(auto_start=True)
 
         instance_id = self.left_label.current_plant_id
         self.left_label.current_plant_id += 1
@@ -551,29 +489,136 @@ class MainWindowSamMixin:
             QMessageBox.warning(self, "失败", f"加载SAM模型失败: {str(error)}")
             return False
 
+    def _ensure_training_project_context(self):
+        if not self.image_paths:
+            return None
+        class_names = []
+        if self.project_metadata:
+            class_names = list(self.project_metadata.get("class_names", []) or [])
+        elif self.current_image_path in self.coco_container:
+            class_names = list(self.coco_container[self.current_image_path].get("class_names", []) or [])
+        project_id, metadata, paths = ensure_project_for_images(self.image_paths, class_names=class_names or None)
+        self.project_id = project_id
+        self.project_metadata = metadata
+        self.project_paths = paths
+        return paths
+
+    def _get_training_output_root(self):
+        if self.project_paths and self.project_paths.get("models_root"):
+            return str((Path(self.project_paths["models_root"]) / "sam_training").resolve())
+        if self.save_path:
+            return str((Path(self.save_path).expanduser().resolve() / "sam_training"))
+        if self.image_paths:
+            try:
+                common_path = os.path.commonpath(self.image_paths)
+            except ValueError:
+                common_path = os.path.dirname(self.image_paths[0])
+            base_dir = Path(common_path)
+            if base_dir.is_file():
+                base_dir = base_dir.parent
+            return str((base_dir / "maize_preseg_artifacts" / "sam_training").resolve())
+        return str((Path.cwd() / "maize_preseg_artifacts" / "sam_training").resolve())
+
+    def _get_training_blocker(self):
+        if self.left_label.mode == "fine_tune":
+            return "请先退出当前微调模式，再开始训练"
+        if hasattr(self, "_has_active_preview_session") and self._has_active_preview_session():
+            return "请先完成或取消当前继续标注/暂存编辑，再开始训练"
+        if self.left_label.preannotation_box_mode:
+            return "请先完成或取消当前框选预标注，再开始训练"
+        if self.left_label.candidate_instances:
+            return "请先接受或拒绝当前预标注候选，再开始训练"
+        return None
+
+    def _mark_training_snapshot_clean(self, snapshot_hashes):
+        for image_path, trained_hash in (snapshot_hashes or {}).items():
+            annotation = self.coco_container.get(image_path)
+            if not annotation:
+                continue
+            image_state = annotation.setdefault("image_state", {})
+            current_hash = annotation.get("annotation_hash") or compute_annotation_hash(
+                annotation.get("plants", []),
+                image_state,
+            )
+            annotation["annotation_hash"] = current_hash
+            if current_hash != trained_hash:
+                continue
+            image_state["last_trained_seen_hash"] = trained_hash
+            image_state["dirty_since_last_train"] = False
+            if image_path == self.current_image_path and self.current_image_state is not image_state:
+                self.current_image_state["last_trained_seen_hash"] = trained_hash
+                self.current_image_state["dirty_since_last_train"] = False
+        if hasattr(self, "update_status_bar"):
+            self.update_status_bar()
+
+    def _handle_sam_training_finished(self, success, message, best_model_path):
+        self.btn_load_sam.setEnabled(True)
+        self.btn_sam_train.setEnabled(True)
+        self.btn_sam_train.setText("开始训练")
+        self.btn_sam_preannotate.setEnabled(True)
+
+        run_info = dict(getattr(self.sam_training_manager, "last_run_info", {}) or {})
+        best_model_path = best_model_path or run_info.get("best_model_path", "")
+
+        if success:
+            snapshot_hashes = run_info.get("snapshot_hashes", {})
+            if self.project_id and best_model_path:
+                version_name = Path(best_model_path).parent.name
+                try:
+                    self.project_metadata = mark_training_success(self.project_id, version_name, snapshot_hashes)
+                except Exception as error:
+                    self.sam_info_text.append(f"训练状态同步失败: {error}")
+            self._mark_training_snapshot_clean(snapshot_hashes)
+
+            validation_output_dir = run_info.get("validation_output_dir", "")
+            run_dir = run_info.get("run_dir", "")
+            if run_dir:
+                self.sam_info_text.append(f"训练产物目录: {run_dir}")
+            if best_model_path:
+                self.sam_info_text.append(f"最佳模型: {best_model_path}")
+            if validation_output_dir:
+                self.sam_info_text.append(f"验证可视化: {validation_output_dir}")
+            self.sam_info_text.append("训练完成")
+
+            detail_lines = [message]
+            if best_model_path:
+                detail_lines.append(f"最佳模型已保存到:\n{best_model_path}")
+            if validation_output_dir:
+                detail_lines.append(f"验证可视化已保存到:\n{validation_output_dir}")
+            QMessageBox.information(self, "训练完成", "\n\n".join(detail_lines))
+            return
+
+        if self.project_id:
+            try:
+                self.project_metadata = mark_training_failed(self.project_id, message)
+            except Exception as error:
+                self.sam_info_text.append(f"训练失败状态同步失败: {error}")
+        self.sam_info_text.append(f"训练失败: {message}")
+        QMessageBox.warning(self, "训练失败", message)
+
     def load_sam_model(self):
         """覆盖旧入口：仅显式加载，不做自动导入。"""
         loaded = self._ensure_sam_model_loaded_interactive("请选择一个SAM模型文件")
         if loaded:
             QMessageBox.information(self, "成功", f"SAM模型加载成功 (类型: {self.sam_manager.model_type})")
     def start_sam_training(self):
-        """覆盖旧流程：训练前允许用户就地显式加载模型。"""
         if self.sam_training_worker and self.sam_training_worker.isRunning():
-            QMessageBox.information(self, "提示", "SAM训练正在进行中")
+            QMessageBox.information(self, "提示", "SAM 训练正在进行中")
             return
 
-        if not self._ensure_sam_model_loaded_interactive("开始训练前需要先加载SAM模型"):
+        if not self._ensure_sam_model_loaded_interactive("开始训练前需要先加载 SAM 模型"):
             return
 
-        if self.left_label.mode == "fine_tune":
-            QMessageBox.warning(self, "警告", "请先退出当前微调模式，再执行框选预标注")
+        blocker = self._get_training_blocker()
+        if blocker:
+            QMessageBox.warning(self, "警告", blocker)
             return
 
-        self.sam_info_text.append(f"COCO容器大小: {len(self.coco_container)}")
-        for image_path, annotation in self.coco_container.items():
-            image_state = annotation.get("image_state", {})
-            completed = image_state.get("annotation_completed", False)
-            self.sam_info_text.append(f"图片: {os.path.basename(image_path)}, 已完成: {completed}")
+        if not self.image_paths:
+            QMessageBox.warning(self, "警告", "请先加载图片")
+            return
+
+        self._ensure_training_project_context()
 
         completed_count = sum(
             1
@@ -581,16 +626,19 @@ class MainWindowSamMixin:
             if ann.get("image_state", {}).get("annotation_completed", False)
         )
         self.sam_info_text.append(f"已完成图片数量: {completed_count}")
-
         if completed_count <= 0:
             QMessageBox.warning(self, "警告", "当前项目还没有已完成图片，无法开始训练")
             return
 
-        if not self.image_paths:
-            QMessageBox.warning(self, "警告", "请先加载图片")
-            return
+        output_dir = self._get_training_output_root()
+        checkpoint_path = self.sam_manager.model_path if self.sam_manager.has_model_loaded() else None
+        self.sam_info_text.append(f"训练产物将保存到: {output_dir}")
+        if self.project_id:
+            try:
+                self.project_metadata = mark_training_started(self.project_id, f"训练目录: {output_dir}")
+            except Exception as error:
+                self.sam_info_text.append(f"训练开始状态同步失败: {error}")
 
-        self.sam_info_text.append("开始训练...")
         self.btn_load_sam.setEnabled(False)
         self.btn_sam_train.setEnabled(False)
         self.btn_sam_train.setText("训练中...")
@@ -600,6 +648,10 @@ class MainWindowSamMixin:
             self.sam_training_manager,
             self.coco_container,
             self.image_paths,
+            train_kwargs={
+                "output_dir": output_dir,
+                "checkpoint_path": checkpoint_path,
+            },
         )
         self.sam_training_worker.finished_signal.connect(self._handle_sam_training_finished)
         self.sam_training_worker.finished.connect(self._cleanup_sam_training_worker)

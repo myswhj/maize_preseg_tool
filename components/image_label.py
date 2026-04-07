@@ -332,23 +332,10 @@ class ImageLabel(QLabel):
         plant = self._find_plant_by_id(parsed["owner_id"])
         if not plant:
             return None
-        polygons = plant.get("polygons", [])
-        labels, outer_indices = self._normalize_labels_for_polygons(plant.get("labels", []), polygons)
-        plant["labels"] = labels
-        if polygon_index < 0 or polygon_index >= len(outer_indices):
-            return None
-        resolved_polygon_index = outer_indices[polygon_index]
-        return {
-            "id": self._make_staging_entity_id("formal", plant.get("id"), polygon_index),
-            "owner_kind": "formal",
-            "owner_id": plant.get("id"),
-            "polygon_index": polygon_index,
-            "actual_polygon_index": resolved_polygon_index,
-            "polygon": polygons[resolved_polygon_index],
-            "polygons": [polygons[resolved_polygon_index]],
-            "label": self._label_for_index(labels, polygon_index),
-            "plant": plant,
-        }
+        for area in self._iter_staging_areas_for_plant(plant):
+            if int(area.get("polygon_index", -1)) == int(polygon_index):
+                return area
+        return None
 
     def enter_fine_tune_mode(self, instance_id):
         """进入微调模式"""
@@ -459,6 +446,12 @@ class ImageLabel(QLabel):
         self.fine_tune_original_data = {}
         self.add_vertex_mode = False
         self.delete_vertex_mode = False
+        self.current_points = []
+        self.current_ignored_points = []
+        self.ignoring_region = False
+        self.current_removal_points = []
+        self.removing_region = False
+        self.current_snap_point = None
         self.selected_entity_kind = None
         self.selected_entity_id = None
         self.update_display()
@@ -486,6 +479,11 @@ class ImageLabel(QLabel):
             self.current_points = []
             self.current_plant_polygons = []
             self.current_plant_labels = []
+            self.current_ignored_points = []
+            self.ignoring_region = False
+            self.current_removal_points = []
+            self.removal_regions = []
+            self.removing_region = False
             self.selected_entity_kind = None
             self.selected_entity_id = None
             self.selected_plant_id = None
@@ -529,6 +527,12 @@ class ImageLabel(QLabel):
         self.current_points = []
         self.current_plant_polygons = []
         self.current_plant_labels = []
+        self.current_ignored_points = []
+        self.ignoring_region = False
+        self.current_removal_points = []
+        self.removal_regions = []
+        self.removing_region = False
+        self.current_snap_point = None
         self.candidate_instances = []
         self.set_split_staging_mode(False)
         self.update_display()
@@ -618,7 +622,7 @@ class ImageLabel(QLabel):
         if main_win and hasattr(main_win, "record_preannotation_adjustment_action"):
             main_win.record_preannotation_adjustment_action(instance_id, action_type, copy.deepcopy(details))
 
-    def update_selected_staging_label(self, new_label):
+    def _legacy_update_selected_staging_label_unused(self, new_label):
         selected_kind, staging = self.get_selected_entity()
         if selected_kind != "staging" or not staging:
             return False, "请先选择一个暂存区域"
@@ -639,8 +643,13 @@ class ImageLabel(QLabel):
             plant = staging["plant"]
             old_polygons = copy.deepcopy(plant.get("polygons", []))
             old_labels = copy.deepcopy(plant.get("labels", []))
-            labels, _ = self._normalize_labels_for_polygons(plant.get("labels", []), plant.get("polygons", []))
-            labels[polygon_index] = new_label
+            actual_polygon_index = staging.get("actual_polygon_index", polygon_index)
+            if staging.get("label_storage") == "per_polygon_fallback":
+                labels = self._ensure_label_slots(plant.get("labels", []), len(plant.get("polygons", [])))
+                labels[actual_polygon_index] = new_label
+            else:
+                labels, _ = self._normalize_labels_for_polygons(plant.get("labels", []), plant.get("polygons", []))
+                labels[polygon_index] = new_label
             plant["labels"] = labels
             touch_instance(plant, "ai_modified" if plant.get("source") in ("ai_accepted", "ai_assisted") else None)
             self._record_fine_tune_state_change(
@@ -690,8 +699,11 @@ class ImageLabel(QLabel):
                 return False, "至少保留一个暂存区域后再删除"
             old_polygons = copy.deepcopy(polygons)
             old_labels = copy.deepcopy(plant.get("labels", []))
-            del polygons[polygon_index]
-            labels = self._ensure_label_slots(plant.get("labels", []), len(old_polygons))
+            actual_polygon_index = staging.get("actual_polygon_index", polygon_index)
+            del polygons[actual_polygon_index]
+            labels = list(plant.get("labels", []) or [])
+            while len(labels) <= polygon_index:
+                labels.append("stem")
             del labels[polygon_index]
             plant["polygons"] = normalize_polygons(polygons)
             plant["labels"] = labels
@@ -791,12 +803,16 @@ class ImageLabel(QLabel):
             plant = staging["plant"]
             old_polygons = copy.deepcopy(plant.get("polygons", []))
             old_labels = copy.deepcopy(plant.get("labels", []))
+            actual_polygon_index = staging.get("actual_polygon_index", polygon_index)
+            polygons = plant.get("polygons", [])
             plant["polygons"] = (
-                plant.get("polygons", [])[:polygon_index]
+                polygons[:actual_polygon_index]
                 + split_polygons
-                + plant.get("polygons", [])[polygon_index + 1:]
+                + polygons[actual_polygon_index + 1:]
             )
-            labels = self._ensure_label_slots(plant.get("labels", []), len(old_polygons))
+            labels = list(plant.get("labels", []) or [])
+            while len(labels) <= polygon_index:
+                labels.append("stem")
             plant["labels"] = labels[:polygon_index] + [label, label] + labels[polygon_index + 1:]
             touch_instance(plant, "ai_modified" if plant.get("source") in ("ai_accepted", "ai_assisted") else None)
             self._record_fine_tune_state_change(
@@ -984,6 +1000,9 @@ class ImageLabel(QLabel):
 
         if self.mode == "fine_tune" and self.fine_tune_instance_id:
             return self._apply_fine_tune_removal_region(unique_points)
+
+        if not self.current_plant_polygons:
+            return False
 
         # 记录操作到栈中
         self.main_stack.append({
@@ -2822,7 +2841,7 @@ class ImageLabel(QLabel):
                 "label": self._label_for_index(labels, index),
             }
 
-    def _iter_formal_staging_areas(self, plant):
+    def _legacy_iter_formal_staging_areas_unused(self, plant):
         polygons = plant.get("polygons", [])
         labels = self._ensure_label_slots(plant.get("labels", []), len(polygons))
         plant["labels"] = labels
@@ -2864,7 +2883,7 @@ class ImageLabel(QLabel):
                 for area in reversed(list(self._iter_formal_removal_areas(plant))):
                     if self._point_hits_polygons(image_pos, area.get("polygons", [])):
                         return "removal", area.get("id")
-                for area in reversed(list(self._iter_formal_staging_areas(plant))):
+                for area in reversed(list(self._iter_staging_areas_for_plant(plant))):
                     if self._point_hits_polygons(image_pos, area.get("polygons", [])):
                         return "staging", area.get("id")
             if self._point_hits_polygons(image_pos, plant.get("polygons", [])):
@@ -3339,7 +3358,8 @@ class ImageLabel(QLabel):
             
             # 绘制暂存区域
             if not summary_mode:
-                for area in self._iter_formal_staging_areas(plant):
+                staging_areas = list(self._iter_staging_areas_for_plant(plant))
+                for area in staging_areas:
                     area_id = area.get("id")
                     is_staging_selected = self.selected_entity_kind == "staging" and self.selected_entity_id == str(area_id)
                     polygon = area.get("polygon", [])
@@ -3363,25 +3383,6 @@ class ImageLabel(QLabel):
                             painter.setPen(QPen(QColor(255, 60, 60), 2, Qt.DashLine))
                             painter.drawPolygon(*qpts)
                             self._draw_polygon_vertices(painter, img_to_screen, [polygon], QColor(255, 60, 60))
-                staging_areas = plant.get("staging_areas", [])
-                for area in staging_areas:
-                    area_id = area.get("id", 0)
-                    is_staging_selected = self.selected_entity_kind == "staging" and int(self.selected_entity_id or 0) == int(area_id)
-                    
-                    area_polygons = area.get("polygons", [])
-                    for polygon in area_polygons:
-                        if len(polygon) >= 3:
-                            qpts = [img_to_screen(point) for point in polygon]
-                            # 绘制暂存区域
-                            fill_color = QColor(0, 180, 255, 60 if not is_staging_selected else 90)
-                            line_color = QColor(0, 150, 255) if not is_staging_selected else QColor(255, 165, 0)
-                            painter.setBrush(QBrush(fill_color))
-                            painter.setPen(QPen(line_color, 2, Qt.DashLine))
-                            painter.drawPolygon(*qpts)
-                            
-                            # 绘制暂存区域的顶点
-                            if is_staging_selected:
-                                self._draw_polygon_vertices(painter, img_to_screen, [polygon], QColor(0, 150, 255))
             
             # 在实例的最左端的点用红色文字标出 plantid
             # 只在摘要模式（右侧画布）下显示
@@ -3399,7 +3400,7 @@ class ImageLabel(QLabel):
                     # 绘制文字
                     painter.setPen(QPen(QColor(255, 0, 0), 1))
                     painter.drawText(label_point, f"plant {plant_id}")
-                for area in self._iter_formal_staging_areas(plant):
+                for area in self._iter_staging_areas_for_plant(plant):
                     rightmost_point = self._get_rightmost_point(area.get("polygon", []))
                     if not rightmost_point:
                         continue
@@ -3593,21 +3594,87 @@ class ImageLabel(QLabel):
             if hasattr(main_win, "_update_staging_controls"):
                 main_win._update_staging_controls()
 
-    def _iter_formal_staging_areas(self, plant):
+    def _iter_active_fine_tune_staging_areas(self):
+        if self.mode != "fine_tune" or not self.fine_tune_instance_id:
+            return
+
+        plant = self._find_plant_by_id(self.fine_tune_instance_id)
+        if not plant:
+            return
+
         polygons = plant.get("polygons", [])
-        labels, outer_indices = self._normalize_labels_for_polygons(plant.get("labels", []), polygons)
+        outer_indices = self._get_outer_polygon_indices(polygons)
+        if not outer_indices and len(polygons) == 1:
+            outer_indices = [0]
+
+        labels = list(plant.get("labels", []) or [])[: len(outer_indices)]
+        while len(labels) < len(outer_indices):
+            labels.append("stem")
         plant["labels"] = labels
-        for label_index, polygon_index in enumerate(outer_indices):
-            polygon = polygons[polygon_index]
+
+        for label_index, actual_polygon_index in enumerate(outer_indices):
+            polygon = polygons[actual_polygon_index]
             yield {
                 "id": self._make_staging_entity_id("formal", plant.get("id"), label_index),
                 "owner_kind": "formal",
                 "owner_id": plant.get("id"),
                 "polygon_index": label_index,
-                "actual_polygon_index": polygon_index,
+                "actual_polygon_index": actual_polygon_index,
                 "polygon": polygon,
                 "polygons": [polygon],
                 "label": self._label_for_index(labels, label_index),
+                "label_storage": "fine_tune_outer",
+                "plant": plant,
+            }
+
+    def _iter_staging_areas_for_plant(self, plant):
+        if not plant:
+            return
+
+        if (
+            self.mode == "fine_tune"
+            and int(plant.get("id", 0)) == int(self.fine_tune_instance_id or 0)
+        ):
+            yield from self._iter_active_fine_tune_staging_areas()
+            return
+
+        yield from self._iter_formal_staging_areas(plant)
+
+    def _iter_formal_staging_areas(self, plant):
+        polygons = plant.get("polygons", [])
+        raw_labels = list(plant.get("labels", []) or [])
+        outer_indices = self._get_outer_polygon_indices(polygons)
+
+        use_outer_mapping = bool(outer_indices) and len(outer_indices) >= len(raw_labels)
+        if use_outer_mapping:
+            labels = raw_labels[:len(outer_indices)]
+            while len(labels) < len(outer_indices):
+                labels.append("stem")
+            mapping = [(label_index, polygon_index, "outer_only") for label_index, polygon_index in enumerate(outer_indices)]
+        elif raw_labels:
+            fallback_count = min(len(raw_labels), len(polygons))
+            labels = self._ensure_label_slots(raw_labels[:fallback_count], fallback_count)
+            mapping = [(index, index, "per_polygon") for index in range(fallback_count)]
+        elif len(polygons) == 1:
+            labels = ["stem"]
+            mapping = [(0, 0, "per_polygon")]
+        else:
+            labels = []
+            mapping = []
+
+        plant["labels"] = labels
+        for label_index, actual_polygon_index, label_storage in mapping:
+            polygon = polygons[actual_polygon_index]
+            yield {
+                "id": self._make_staging_entity_id("formal", plant.get("id"), label_index),
+                "owner_kind": "formal",
+                "owner_id": plant.get("id"),
+                "polygon_index": label_index,
+                "actual_polygon_index": actual_polygon_index,
+                "polygon": polygon,
+                "polygons": [polygon],
+                "label": self._label_for_index(labels, label_index),
+                "label_storage": label_storage,
                 "plant": plant,
             }
 
@@ -3696,8 +3763,26 @@ class ImageLabel(QLabel):
             plant = staging["plant"]
             old_polygons = copy.deepcopy(plant.get("polygons", []))
             old_labels = copy.deepcopy(plant.get("labels", []))
-            labels, _ = self._normalize_labels_for_polygons(plant.get("labels", []), plant.get("polygons", []))
-            labels[polygon_index] = new_label
+            actual_polygon_index = staging.get("actual_polygon_index", polygon_index)
+            if (
+                self.mode == "fine_tune"
+                and int(plant.get("id", 0)) == int(self.fine_tune_instance_id or 0)
+            ) or staging.get("label_storage") == "fine_tune_outer":
+                labels = list(plant.get("labels", []) or [])
+                while len(labels) <= polygon_index:
+                    labels.append("stem")
+                labels[polygon_index] = new_label
+            elif staging.get("label_storage") == "per_polygon":
+                labels = self._ensure_label_slots(
+                    list(plant.get("labels", []) or []),
+                    max(len(plant.get("polygons", [])), actual_polygon_index + 1),
+                )
+                labels[actual_polygon_index] = new_label
+            else:
+                labels = list(plant.get("labels", []) or [])
+                while len(labels) <= polygon_index:
+                    labels.append("stem")
+                labels[polygon_index] = new_label
             plant["labels"] = labels
             touch_instance(plant, "ai_modified" if plant.get("source") in ("ai_accepted", "ai_assisted") else None)
             self._record_fine_tune_state_change(
@@ -3795,15 +3880,24 @@ class ImageLabel(QLabel):
         else:
             plant = staging["plant"]
             polygons = plant.get("polygons", [])
-            outer_indices = self._get_outer_polygon_indices(polygons)
-            if len(outer_indices) <= 1:
+            staging_areas = list(self._iter_staging_areas_for_plant(plant))
+            if len(staging_areas) <= 1:
                 return False, "至少保留一个暂存区域后再删除"
             old_polygons = copy.deepcopy(polygons)
             old_labels = copy.deepcopy(plant.get("labels", []))
-            actual_polygon_index = staging.get("actual_polygon_index", outer_indices[polygon_index])
+            actual_polygon_index = staging.get("actual_polygon_index", polygon_index)
             del polygons[actual_polygon_index]
-            labels, _ = self._normalize_labels_for_polygons(plant.get("labels", []), old_polygons)
-            del labels[polygon_index]
+            if (
+                self.mode == "fine_tune"
+                and int(plant.get("id", 0)) == int(self.fine_tune_instance_id or 0)
+            ) or staging.get("label_storage") == "fine_tune_outer":
+                labels = list(plant.get("labels", []) or [])
+                while len(labels) <= polygon_index:
+                    labels.append("stem")
+                del labels[polygon_index]
+            else:
+                labels, _ = self._normalize_labels_for_polygons(plant.get("labels", []), old_polygons)
+                del labels[polygon_index]
             plant["polygons"] = normalize_polygons(polygons)
             plant["labels"] = labels
             touch_instance(plant, "ai_modified" if plant.get("source") in ("ai_accepted", "ai_assisted") else None)
@@ -3819,7 +3913,7 @@ class ImageLabel(QLabel):
             self._notify_preannotation_adjustment(
                 plant.get("id"),
                 "delete_staging_polygon",
-                {"polygon_index": polygon_index},
+                {"polygon_index": polygon_index, "actual_polygon_index": actual_polygon_index},
             )
 
         self.set_split_staging_mode(False)
@@ -3904,7 +3998,15 @@ class ImageLabel(QLabel):
             actual_polygon_index = staging.get("actual_polygon_index", polygon_index)
             polygons = plant.get("polygons", [])
             plant["polygons"] = polygons[:actual_polygon_index] + split_polygons + polygons[actual_polygon_index + 1:]
-            labels, _ = self._normalize_labels_for_polygons(plant.get("labels", []), old_polygons)
+            if (
+                self.mode == "fine_tune"
+                and int(plant.get("id", 0)) == int(self.fine_tune_instance_id or 0)
+            ) or staging.get("label_storage") == "fine_tune_outer":
+                labels = list(plant.get("labels", []) or [])
+                while len(labels) <= polygon_index:
+                    labels.append("stem")
+            else:
+                labels, _ = self._normalize_labels_for_polygons(plant.get("labels", []), old_polygons)
             plant["labels"] = labels[:polygon_index] + [label, label] + labels[polygon_index + 1:]
             touch_instance(plant, "ai_modified" if plant.get("source") in ("ai_accepted", "ai_assisted") else None)
             self._record_fine_tune_state_change(
@@ -3912,12 +4014,12 @@ class ImageLabel(QLabel):
                 old_polygons,
                 old_labels,
                 "split_polygon",
-                {"polygon_index": polygon_index, "gap": gap},
+                {"polygon_index": polygon_index, "actual_polygon_index": actual_polygon_index, "gap": gap},
             )
             self._notify_preannotation_adjustment(
                 plant.get("id"),
                 "split_staging_polygon",
-                {"polygon_index": polygon_index, "gap": gap},
+                {"polygon_index": polygon_index, "actual_polygon_index": actual_polygon_index, "gap": gap},
             )
             self.select_entity("staging", self._make_staging_entity_id("formal", plant.get("id"), polygon_index))
 
