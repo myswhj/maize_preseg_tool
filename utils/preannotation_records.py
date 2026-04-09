@@ -4,62 +4,54 @@ import os
 
 from utils.annotation_schema import clone_polygons, current_timestamp
 
-CORRECTION_RECORD_SCHEMA_VERSION = 2
-SEMANTIC_ACTION_AUTO = "__auto__"
-SEMANTIC_ACTIONS = (
-    "keep",
-    "trim",
-    "split",
-    "merge",
-    "relabel",
-    "ignore",
-    "reject",
-)
+CORRECTION_RECORD_SCHEMA_VERSION = 6
+DEFAULT_REGION_LABEL = "stem"
 REASON_CODES = (
-    "weak_stem_support",
-    "cross_neighbor_region",
-    "isolated_fragment",
-    "occlusion_too_heavy",
-    "boundary_refined_only",
+    "occluded_by_left_plant",
+    "occluded_by_right_plant",
+    "occluded_by_background",
+    "neighbor_false_positive",
+    "background_false_positive",
+    "wrong_fragment",
+    "ear_stem_segmentation",
 )
-SEMANTIC_ACTION_LABELS = {
-    SEMANTIC_ACTION_AUTO: "Auto",
-    "keep": "Keep",
-    "trim": "Trim",
-    "split": "Split",
-    "merge": "Merge",
-    "relabel": "Relabel",
-    "ignore": "Ignore",
-    "reject": "Reject",
-}
 REASON_CODE_LABELS = {
-    "weak_stem_support": "Weak Stem Support",
-    "cross_neighbor_region": "Cross Neighbor Region",
-    "isolated_fragment": "Isolated Fragment",
-    "occlusion_too_heavy": "Occlusion Too Heavy",
-    "boundary_refined_only": "Boundary Refined Only",
+    "occluded_by_left_plant": "Occluded By Left Plant",
+    "occluded_by_right_plant": "Occluded By Right Plant",
+    "occluded_by_background": "Occluded By Background",
+    "neighbor_false_positive": "Neighbor False Positive",
+    "background_false_positive": "Background False Positive",
+    "wrong_fragment": "Wrong Fragment",
+    "ear_stem_segmentation": "Ear Stem Segmentation",
 }
+VALID_STATUSES = {"accepted", "modified", "ignored", "rejected", "merged"}
 
 GEOMETRY_REFINEMENT_EVENTS = {"add_vertex", "delete_vertex", "drag_vertex"}
-TRIM_EVENTS = {"add_hole", "delete_staging_polygon"}
+TRIM_EVENTS = {"add_hole", "delete_staging_polygon", "delete_removal_region"}
 SPLIT_EVENTS = {"split_staging_polygon"}
 RELABEL_EVENTS = {"update_staging_label"}
+POLYGON_MERGE_EVENTS = {"merge_staging_polygon"}
 IGNORE_EVENTS = {"candidate_ignored", "instance_ignored"}
 REJECT_EVENTS = {"candidate_rejected", "delete_instance"}
-MERGE_EVENTS = {"proposal_merged", "merge_staging_polygon"}
+MERGED_STATUS_EVENTS = {"proposal_merged"}
+MODIFICATION_EVENTS = (
+    GEOMETRY_REFINEMENT_EVENTS
+    | TRIM_EVENTS
+    | SPLIT_EVENTS
+    | RELABEL_EVENTS
+    | POLYGON_MERGE_EVENTS
+)
 
 
-def normalize_semantic_action(action, allow_auto=False):
-    if action is None:
-        return SEMANTIC_ACTION_AUTO if allow_auto else None
-    value = str(action).strip().lower()
-    if not value:
-        return SEMANTIC_ACTION_AUTO if allow_auto else None
-    if value == SEMANTIC_ACTION_AUTO and allow_auto:
-        return value
-    if value in SEMANTIC_ACTIONS:
-        return value
-    return None
+def _signed_polygon_area(polygon):
+    points = list(polygon or [])
+    if len(points) < 3:
+        return 0.0
+    area = 0.0
+    for index, point in enumerate(points):
+        next_point = points[(index + 1) % len(points)]
+        area += float(point[0]) * float(next_point[1]) - float(next_point[0]) * float(point[1])
+    return area / 2.0
 
 
 def normalize_reason_code(reason_code):
@@ -80,6 +72,27 @@ def normalize_reason_codes(reason_codes):
     return normalized
 
 
+def normalize_labels(labels, polygons):
+    outer_polygon_count = sum(1 for polygon in polygons or [] if _signed_polygon_area(polygon) < 0)
+    if outer_polygon_count <= 0 and polygons:
+        outer_polygon_count = len(polygons)
+    normalized = []
+    for label in list(labels or [])[:outer_polygon_count]:
+        value = str(label or "").strip() or DEFAULT_REGION_LABEL
+        normalized.append(value)
+    while len(normalized) < outer_polygon_count:
+        normalized.append(DEFAULT_REGION_LABEL)
+    return normalized
+
+
+def make_annotation_state(polygons, labels=None):
+    normalized_polygons = clone_polygons(polygons or [])
+    return {
+        "polygons": normalized_polygons,
+        "labels": normalize_labels(labels, normalized_polygons),
+    }
+
+
 def normalize_event_log(entries):
     events = []
     for entry in entries or []:
@@ -96,72 +109,98 @@ def normalize_event_log(entries):
         reason_code = normalize_reason_code(entry.get("reason_code"))
         if reason_code:
             normalized["reason_code"] = reason_code
-        semantic_action = normalize_semantic_action(entry.get("semantic_action"))
-        if semantic_action:
-            normalized["semantic_action"] = semantic_action
         events.append(normalized)
     return events
 
 
-def infer_semantic_action_from_parts(status, event_log, final_polygons):
-    normalized_status = str(status or "").strip().lower()
-    event_types = {entry.get("event_type") for entry in event_log or [] if entry.get("event_type")}
+def normalize_reason_segments(segments):
+    normalized_segments = []
+    for index, segment in enumerate(segments or []):
+        if not isinstance(segment, dict):
+            continue
+        start_source = segment.get("start_state") or {}
+        end_source = segment.get("end_state") or {}
+        start_state = make_annotation_state(
+            segment.get("start_polygons", start_source.get("polygons")),
+            segment.get("start_labels", start_source.get("labels")),
+        )
+        end_state = make_annotation_state(
+            segment.get("end_polygons", end_source.get("polygons")),
+            segment.get("end_labels", end_source.get("labels")),
+        )
+        event_log = normalize_event_log(segment.get("event_log") or segment.get("events") or [])
+        if not start_state["polygons"] and end_state["polygons"]:
+            start_state = make_annotation_state(end_state["polygons"], end_state["labels"])
+        if not end_state["polygons"] and start_state["polygons"] and not event_log:
+            end_state = make_annotation_state(start_state["polygons"], start_state["labels"])
+        normalized_segments.append(
+            {
+                "segment_id": str(segment.get("segment_id") or f"seg_{index + 1:04d}"),
+                "reason_code": normalize_reason_code(segment.get("reason_code")),
+                "started_at": segment.get("started_at") or (event_log[0]["timestamp"] if event_log else current_timestamp()),
+                "updated_at": segment.get("updated_at") or segment.get("ended_at") or current_timestamp(),
+                "start_polygons": start_state["polygons"],
+                "start_labels": start_state["labels"],
+                "end_polygons": end_state["polygons"],
+                "end_labels": end_state["labels"],
+                "event_log": event_log,
+            }
+        )
+    return normalized_segments
 
-    if normalized_status == "ignored":
-        return "ignore"
-    if normalized_status == "rejected":
-        return "reject"
-    if normalized_status == "merged":
-        return "merge"
+
+def infer_status_from_record(record):
+    event_types = {entry.get("event_type") for entry in record.get("event_log", []) if entry.get("event_type")}
+    final_polygons = record.get("final_polygons") or []
 
     if event_types & IGNORE_EVENTS:
-        return "ignore"
-    if event_types & MERGE_EVENTS:
-        return "merge"
+        return "ignored"
+    if event_types & MERGED_STATUS_EVENTS:
+        return "merged"
     if event_types & REJECT_EVENTS and not final_polygons:
-        return "reject"
-    if event_types & SPLIT_EVENTS:
-        return "split"
-    if event_types & TRIM_EVENTS:
-        return "trim"
-    if event_types & RELABEL_EVENTS and not (event_types & GEOMETRY_REFINEMENT_EVENTS):
-        return "relabel"
-    if event_types & GEOMETRY_REFINEMENT_EVENTS:
-        return "keep"
-    if event_types & RELABEL_EVENTS:
-        return "relabel"
-    return "keep"
+        return "rejected"
+    if event_types & MODIFICATION_EVENTS:
+        return "modified"
+    return "accepted"
+
+
+def normalize_status(status, record):
+    value = str(status or "").strip().lower()
+    if value in {"ignored", "rejected", "merged"}:
+        return value
+    inferred = infer_status_from_record(record)
+    if value == "modified" and inferred == "accepted":
+        return "modified"
+    if value in VALID_STATUSES:
+        return value if value in {"ignored", "rejected", "merged"} else inferred
+    return inferred
 
 
 def normalize_record(record):
     source = copy.deepcopy(record or {})
     created_at = source.get("created_at") or current_timestamp()
-    original_polygons = clone_polygons(source.get("original_polygons") or [])
-    final_polygons = clone_polygons(source.get("final_polygons") or [])
+    original_state = make_annotation_state(
+        source.get("original_polygons") or [],
+        source.get("original_labels"),
+    )
+    final_state = make_annotation_state(
+        source.get("final_polygons") or original_state["polygons"],
+        source.get("final_labels"),
+    )
     event_log = normalize_event_log(source.get("event_log") or source.get("operations") or [])
     reason_codes = normalize_reason_codes(source.get("reason_codes") or [])
     active_reason_code = normalize_reason_code(source.get("active_reason_code"))
     if active_reason_code and active_reason_code not in reason_codes:
         reason_codes.append(active_reason_code)
 
-    semantic_action = normalize_semantic_action(source.get("semantic_action"))
-    semantic_action_source = str(source.get("semantic_action_source") or "").strip().lower()
-    if semantic_action_source not in ("auto", "manual"):
-        semantic_action_source = "manual" if semantic_action else "auto"
-    if not semantic_action:
-        semantic_action_source = "auto"
-        semantic_action = infer_semantic_action_from_parts(
-            source.get("status"),
-            event_log,
-            final_polygons,
-        )
-    elif semantic_action_source == "auto":
-        semantic_action = infer_semantic_action_from_parts(
-            source.get("status"),
-            event_log,
-            final_polygons,
-        )
-        semantic_action_source = "auto"
+    reason_segments = normalize_reason_segments(source.get("reason_segments") or source.get("reason_chains") or [])
+    active_reason_segment_index = source.get("active_reason_segment_index")
+    try:
+        active_reason_segment_index = int(active_reason_segment_index)
+    except (TypeError, ValueError):
+        active_reason_segment_index = None
+    if active_reason_segment_index is not None and not (0 <= active_reason_segment_index < len(reason_segments)):
+        active_reason_segment_index = None
 
     normalized = {
         "record_id": str(source.get("record_id") or ""),
@@ -173,16 +212,18 @@ def normalize_record(record):
         "roi_box": copy.deepcopy(source.get("roi_box") or []),
         "candidate_id": source.get("candidate_id"),
         "confidence": source.get("confidence"),
-        "original_polygons": original_polygons,
-        "final_polygons": final_polygons,
+        "original_polygons": original_state["polygons"],
+        "original_labels": original_state["labels"],
+        "final_polygons": final_state["polygons"],
+        "final_labels": final_state["labels"],
         "formal_instance_id": source.get("formal_instance_id"),
-        "status": str(source.get("status") or "accepted"),
-        "semantic_action": semantic_action,
-        "semantic_action_source": semantic_action_source,
         "reason_codes": reason_codes,
         "active_reason_code": active_reason_code,
         "event_log": event_log,
+        "reason_segments": reason_segments,
+        "active_reason_segment_index": active_reason_segment_index,
     }
+    normalized["status"] = normalize_status(source.get("status"), normalized)
     if normalized["formal_instance_id"] is not None:
         try:
             normalized["formal_instance_id"] = int(normalized["formal_instance_id"])
@@ -205,10 +246,9 @@ def normalize_records(records):
     return normalized
 
 
-def append_event(record, event_type, details=None, reason_code=None, semantic_action=None):
-    normalized_record = normalize_record(record)
+def _append_event_to_record(normalized_record, event_type, details=None, reason_code=None, timestamp=None):
     event = {
-        "timestamp": current_timestamp(),
+        "timestamp": timestamp or current_timestamp(),
         "event_type": str(event_type),
         "details": copy.deepcopy(details or {}),
     }
@@ -217,19 +257,16 @@ def append_event(record, event_type, details=None, reason_code=None, semantic_ac
         event["reason_code"] = normalized_reason
         if normalized_reason not in normalized_record["reason_codes"]:
             normalized_record["reason_codes"].append(normalized_reason)
-    normalized_action = normalize_semantic_action(semantic_action)
-    if normalized_action:
-        event["semantic_action"] = normalized_action
     normalized_record["event_log"].append(event)
     normalized_record["updated_at"] = event["timestamp"]
-    if normalized_record.get("semantic_action_source") != "manual":
-        normalized_record["semantic_action"] = infer_semantic_action_from_parts(
-            normalized_record.get("status"),
-            normalized_record.get("event_log"),
-            normalized_record.get("final_polygons"),
-        )
-        normalized_record["semantic_action_source"] = "auto"
     normalized_record["operations"] = copy.deepcopy(normalized_record["event_log"])
+    return event
+
+
+def append_event(record, event_type, details=None, reason_code=None):
+    normalized_record = normalize_record(record)
+    event = _append_event_to_record(normalized_record, event_type, details=details, reason_code=reason_code)
+    normalized_record["status"] = infer_status_from_record(normalized_record)
     record.clear()
     record.update(normalized_record)
     return event
@@ -247,39 +284,140 @@ def set_active_reason(record, reason_code):
     return normalized_reason
 
 
-def set_semantic_action(record, semantic_action, source="manual"):
-    normalized_record = normalize_record(record)
-    normalized_action = normalize_semantic_action(semantic_action)
-    if not normalized_action:
-        normalized_record["semantic_action"] = infer_semantic_action_from_parts(
-            normalized_record.get("status"),
-            normalized_record.get("event_log"),
-            normalized_record.get("final_polygons"),
-        )
-        normalized_record["semantic_action_source"] = "auto"
-    else:
-        normalized_record["semantic_action"] = normalized_action
-        normalized_record["semantic_action_source"] = "manual" if source == "manual" else "auto"
-    normalized_record["updated_at"] = current_timestamp()
-    record.clear()
-    record.update(normalized_record)
-    return normalized_record["semantic_action"]
-
-
 def set_status(record, status):
     normalized_record = normalize_record(record)
-    normalized_record["status"] = str(status or normalized_record.get("status") or "accepted")
+    normalized_record["status"] = normalize_status(status, normalized_record)
     normalized_record["updated_at"] = current_timestamp()
-    if normalized_record.get("semantic_action_source") != "manual":
-        normalized_record["semantic_action"] = infer_semantic_action_from_parts(
-            normalized_record.get("status"),
-            normalized_record.get("event_log"),
-            normalized_record.get("final_polygons"),
-        )
-        normalized_record["semantic_action_source"] = "auto"
     record.clear()
     record.update(normalized_record)
     return normalized_record["status"]
+
+
+def set_annotation_state(record, prefix, polygons, labels=None):
+    normalized_record = normalize_record(record)
+    state = make_annotation_state(polygons, labels)
+    normalized_record[f"{prefix}_polygons"] = state["polygons"]
+    normalized_record[f"{prefix}_labels"] = state["labels"]
+    normalized_record["updated_at"] = current_timestamp()
+    if prefix == "final":
+        normalized_record["status"] = infer_status_from_record(normalized_record)
+    record.clear()
+    record.update(normalized_record)
+    return state
+
+
+def close_active_reason_segment(record, end_polygons=None, end_labels=None):
+    normalized_record = normalize_record(record)
+    index = normalized_record.get("active_reason_segment_index")
+    if index is None:
+        record.clear()
+        record.update(normalized_record)
+        return None
+    if 0 <= index < len(normalized_record["reason_segments"]):
+        state = make_annotation_state(
+            normalized_record.get("final_polygons") if end_polygons is None else end_polygons,
+            normalized_record.get("final_labels") if end_labels is None else end_labels,
+        )
+        segment = normalized_record["reason_segments"][index]
+        segment["end_polygons"] = state["polygons"]
+        segment["end_labels"] = state["labels"]
+        segment["updated_at"] = current_timestamp()
+    normalized_record["active_reason_segment_index"] = None
+    normalized_record["updated_at"] = current_timestamp()
+    record.clear()
+    record.update(normalized_record)
+    return normalized_record
+
+
+def sync_active_reason_segment(record, polygons=None, labels=None):
+    normalized_record = normalize_record(record)
+    index = normalized_record.get("active_reason_segment_index")
+    if index is None or not (0 <= index < len(normalized_record["reason_segments"])):
+        record.clear()
+        record.update(normalized_record)
+        return normalized_record
+    state = make_annotation_state(
+        normalized_record.get("final_polygons") if polygons is None else polygons,
+        normalized_record.get("final_labels") if labels is None else labels,
+    )
+    segment = normalized_record["reason_segments"][index]
+    segment["end_polygons"] = state["polygons"]
+    segment["end_labels"] = state["labels"]
+    segment["updated_at"] = current_timestamp()
+    normalized_record["updated_at"] = current_timestamp()
+    record.clear()
+    record.update(normalized_record)
+    return normalized_record
+
+
+def append_reasoned_event(
+    record,
+    event_type,
+    details=None,
+    reason_code=None,
+    before_polygons=None,
+    before_labels=None,
+    after_polygons=None,
+    after_labels=None,
+):
+    normalized_record = normalize_record(record)
+    event = _append_event_to_record(
+        normalized_record,
+        event_type,
+        details=details,
+        reason_code=reason_code,
+    )
+
+    before_state = make_annotation_state(
+        normalized_record.get("final_polygons") if before_polygons is None else before_polygons,
+        normalized_record.get("final_labels") if before_labels is None else before_labels,
+    )
+    after_state = make_annotation_state(
+        normalized_record.get("final_polygons") if after_polygons is None else after_polygons,
+        normalized_record.get("final_labels") if after_labels is None else after_labels,
+    )
+    segment_reason = normalize_reason_code(reason_code) or normalized_record.get("active_reason_code")
+    segment_index = normalized_record.get("active_reason_segment_index")
+
+    if segment_index is None or not (0 <= segment_index < len(normalized_record["reason_segments"])):
+        segment_index = None
+    elif normalized_record["reason_segments"][segment_index].get("reason_code") != segment_reason:
+        active_segment = normalized_record["reason_segments"][segment_index]
+        active_segment["end_polygons"] = before_state["polygons"]
+        active_segment["end_labels"] = before_state["labels"]
+        active_segment["updated_at"] = event["timestamp"]
+        segment_index = None
+
+    if segment_index is None:
+        normalized_record["reason_segments"].append(
+            {
+                "segment_id": f"seg_{len(normalized_record['reason_segments']) + 1:04d}",
+                "reason_code": segment_reason,
+                "started_at": event["timestamp"],
+                "updated_at": event["timestamp"],
+                "start_polygons": before_state["polygons"],
+                "start_labels": before_state["labels"],
+                "end_polygons": before_state["polygons"],
+                "end_labels": before_state["labels"],
+                "event_log": [],
+            }
+        )
+        segment_index = len(normalized_record["reason_segments"]) - 1
+        normalized_record["active_reason_segment_index"] = segment_index
+
+    segment = normalized_record["reason_segments"][segment_index]
+    segment["event_log"].append(copy.deepcopy(event))
+    segment["end_polygons"] = after_state["polygons"]
+    segment["end_labels"] = after_state["labels"]
+    segment["updated_at"] = event["timestamp"]
+
+    normalized_record["final_polygons"] = after_state["polygons"]
+    normalized_record["final_labels"] = after_state["labels"]
+    normalized_record["status"] = infer_status_from_record(normalized_record)
+    normalized_record["operations"] = copy.deepcopy(normalized_record["event_log"])
+    record.clear()
+    record.update(normalized_record)
+    return event
 
 
 def load_records_from_file(path, image_path=None):

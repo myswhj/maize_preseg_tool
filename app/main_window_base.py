@@ -28,7 +28,6 @@ from utils.annotation_schema import (
     normalize_annotation_timing_state,
 )
 from utils.interaction_state import InteractionStateMachine
-from utils.preannotation_records import SEMANTIC_ACTION_AUTO
 
 
 class MainWindowBase(QMainWindow):
@@ -71,8 +70,8 @@ class MainWindowBase(QMainWindow):
         self.preannotation_records_by_image = {}
         self.preannotation_record_counter = 1
         self.preannotation_fine_tune_sessions = {}
+        self.preannotation_pending_fine_tune_entries = set()
         self.preannotation_default_reason_code = None
-        self.preannotation_default_semantic_action = SEMANTIC_ACTION_AUTO
         self._updating_preannotation_controls = False
         self.interaction_state_machine = InteractionStateMachine()
         self.annotation_timer = QTimer(self)

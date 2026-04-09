@@ -73,6 +73,16 @@ def calculate_total_polygon_area(polygons):
     return float(total_area)
 
 
+def _signed_polygon_area(polygon):
+    if not polygon or len(polygon) < 3:
+        return 0.0
+    area = 0.0
+    for index, point in enumerate(polygon):
+        next_point = polygon[(index + 1) % len(polygon)]
+        area += float(point[0]) * float(next_point[1]) - float(next_point[0]) * float(point[1])
+    return area / 2.0
+
+
 
 
 
@@ -149,6 +159,9 @@ def make_formal_instance(
     """创建正式实例对象。"""
     polygons = normalize_polygons(polygons)
     now = current_timestamp()
+    outer_polygon_count = sum(1 for polygon in polygons if _signed_polygon_area(polygon) < 0)
+    if outer_polygon_count <= 0 and polygons:
+        outer_polygon_count = len(polygons)
     return {
         "id": int(instance_id),
         "polygons": polygons,
@@ -160,6 +173,7 @@ def make_formal_instance(
         "confirmed": True,
         "created_at": created_at or now,
         "updated_at": updated_at or now,
+        "labels": ["stem"] * outer_polygon_count,
     }
 
 
@@ -189,7 +203,9 @@ def normalize_formal_instance(instance, fallback_id):
     created_at = instance.get("created_at") or current_timestamp()
     updated_at = instance.get("updated_at") or created_at
 
-    outer_polygon_count = sum(1 for polygon in polygons if calculate_polygon_area(polygon) < 0)
+    outer_polygon_count = sum(1 for polygon in polygons if _signed_polygon_area(polygon) < 0)
+    if outer_polygon_count <= 0 and polygons:
+        outer_polygon_count = len(polygons)
     labels = list(instance.get("labels", []))[:outer_polygon_count]
     while len(labels) < outer_polygon_count:
         labels.append("stem")

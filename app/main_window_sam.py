@@ -5,17 +5,20 @@ from pathlib import Path
 from PyQt5.QtWidgets import QFileDialog, QInputDialog, QMessageBox
 
 from utils.annotation_schema import compute_annotation_hash, current_timestamp, make_formal_instance
-from utils.helpers import calculate_polygon_area
+from utils.helpers import calculate_signed_polygon_area
 from utils.preannotation_records import (
-    SEMANTIC_ACTION_AUTO,
     append_event,
+    append_reasoned_event,
+    close_active_reason_segment,
     load_records_from_file,
+    make_annotation_state,
     next_record_counter,
     normalize_record,
     save_records_to_file,
     set_active_reason,
-    set_semantic_action,
+    set_annotation_state,
     set_status,
+    sync_active_reason_segment,
 )
 from utils.project_context import (
     ensure_project_for_images,
@@ -88,6 +91,65 @@ class MainWindowSamMixin:
                 return record
         return None
 
+    def _remove_preannotation_record(self, record_id):
+        if not record_id:
+            return False
+        original_count = len(self.preannotation_adjustment_records)
+        self.preannotation_adjustment_records = [
+            record for record in self.preannotation_adjustment_records if record.get("record_id") != record_id
+        ]
+        return len(self.preannotation_adjustment_records) != original_count
+
+    @staticmethod
+    def _record_state_snapshot(polygons, labels=None):
+        return make_annotation_state(polygons, labels)
+
+    def _get_plant_state_snapshot(self, plant):
+        if not plant:
+            return self._record_state_snapshot([], [])
+        return self._record_state_snapshot(plant.get("polygons", []), plant.get("labels", []))
+
+    def _get_record_final_state_snapshot(self, record):
+        if not record:
+            return self._record_state_snapshot([], [])
+        return self._record_state_snapshot(record.get("final_polygons", []), record.get("final_labels", []))
+
+    def _set_record_final_state(self, record, polygons, labels=None):
+        state = set_annotation_state(record, "final", polygons, labels)
+        return {"polygons": state["polygons"], "labels": state["labels"]}
+
+    def _close_reason_segment(self, record):
+        if not record:
+            return
+        final_state = self._get_record_final_state_snapshot(record)
+        close_active_reason_segment(
+            record,
+            end_polygons=final_state["polygons"],
+            end_labels=final_state["labels"],
+        )
+
+    def _append_reasoned_adjustment(
+        self,
+        record,
+        event_type,
+        details=None,
+        before_state=None,
+        after_state=None,
+        reason_code=None,
+    ):
+        before_state = before_state or self._get_record_final_state_snapshot(record)
+        after_state = after_state or before_state
+        append_reasoned_event(
+            record,
+            event_type,
+            details=details,
+            reason_code=reason_code if reason_code is not None else record.get("active_reason_code"),
+            before_polygons=before_state["polygons"],
+            before_labels=before_state["labels"],
+            after_polygons=after_state["polygons"],
+            after_labels=after_state["labels"],
+        )
+
     def _get_correction_filename(self, image_path=None):
         target_image = image_path or self.current_image_path
         if not target_image:
@@ -143,7 +205,7 @@ class MainWindowSamMixin:
         if not target_image:
             self.preannotation_adjustment_records = []
             self.preannotation_record_counter = 1
-            self._sync_preannotation_judgement_ui()
+            self._sync_preannotation_reason_ui()
             return []
 
         if target_image in self.preannotation_records_by_image:
@@ -157,7 +219,7 @@ class MainWindowSamMixin:
                 self.preannotation_adjustment_records = []
 
         self.preannotation_record_counter = next_record_counter(self.preannotation_adjustment_records, default_value=1)
-        self._sync_preannotation_judgement_ui()
+        self._sync_preannotation_reason_ui()
         return self.preannotation_adjustment_records
 
     def _save_preannotation_adjustment_records(self, image_path=None):
@@ -180,11 +242,6 @@ class MainWindowSamMixin:
         if hasattr(self, "combo_preannotation_reason"):
             return self.combo_preannotation_reason.currentData() or None
         return self.preannotation_default_reason_code
-
-    def _get_current_preannotation_semantic_action(self):
-        if hasattr(self, "combo_preannotation_semantic_action"):
-            return self.combo_preannotation_semantic_action.currentData() or SEMANTIC_ACTION_AUTO
-        return self.preannotation_default_semantic_action or SEMANTIC_ACTION_AUTO
 
     @staticmethod
     def _set_combobox_data(combo_box, value, default_index=0):
@@ -228,26 +285,26 @@ class MainWindowSamMixin:
         return {"kind": "formal", "candidate": None, "plant": plant, "record": record}
 
     def _get_active_preannotation_record(self):
-        return self._get_active_preannotation_context().get("record")
+        context = self._get_active_preannotation_context()
+        plant = context.get("plant")
+        if not plant:
+            return None
+        instance_id = int(plant.get("id", 0))
+        if instance_id not in self.preannotation_fine_tune_sessions:
+            return None
+        return context.get("record")
 
-    def _sync_preannotation_judgement_ui(self):
+    def _sync_preannotation_reason_ui(self):
         if getattr(self, "_updating_preannotation_controls", False):
             return
         self._updating_preannotation_controls = True
         try:
             record = self._get_active_preannotation_record()
             reason_code = self.preannotation_default_reason_code
-            semantic_action = self.preannotation_default_semantic_action or SEMANTIC_ACTION_AUTO
             if record:
                 reason_code = record.get("active_reason_code")
-                if record.get("semantic_action_source") == "manual":
-                    semantic_action = record.get("semantic_action") or SEMANTIC_ACTION_AUTO
-                else:
-                    semantic_action = SEMANTIC_ACTION_AUTO
             if hasattr(self, "combo_preannotation_reason"):
                 self._set_combobox_data(self.combo_preannotation_reason, reason_code, default_index=0)
-            if hasattr(self, "combo_preannotation_semantic_action"):
-                self._set_combobox_data(self.combo_preannotation_semantic_action, semantic_action, default_index=0)
         finally:
             self._updating_preannotation_controls = False
 
@@ -260,40 +317,18 @@ class MainWindowSamMixin:
         if not record:
             return
         previous_reason = record.get("active_reason_code")
+        if previous_reason != reason_code:
+            self._close_reason_segment(record)
         set_active_reason(record, reason_code)
         if previous_reason != record.get("active_reason_code"):
             append_event(
                 record,
                 "reason_selected",
-                {"reason_code": record.get("active_reason_code")},
+                {
+                    "previous_reason_code": previous_reason,
+                    "reason_code": record.get("active_reason_code"),
+                },
                 reason_code=record.get("active_reason_code"),
-            )
-            self._persist_preannotation_adjustment_records()
-
-    def on_preannotation_semantic_action_changed(self, _index):
-        if getattr(self, "_updating_preannotation_controls", False):
-            return
-        semantic_action = self._get_current_preannotation_semantic_action()
-        self.preannotation_default_semantic_action = semantic_action
-        record = self._get_active_preannotation_record()
-        if not record:
-            return
-        previous_action = record.get("semantic_action")
-        previous_source = record.get("semantic_action_source")
-        if semantic_action == SEMANTIC_ACTION_AUTO:
-            set_semantic_action(record, None, source="auto")
-        else:
-            set_semantic_action(record, semantic_action, source="manual")
-        if (
-            previous_action != record.get("semantic_action")
-            or previous_source != record.get("semantic_action_source")
-        ):
-            append_event(
-                record,
-                "semantic_action_selected",
-                {"semantic_action": semantic_action},
-                reason_code=record.get("active_reason_code"),
-                semantic_action=None if semantic_action == SEMANTIC_ACTION_AUTO else semantic_action,
             )
             self._persist_preannotation_adjustment_records()
 
@@ -301,40 +336,33 @@ class MainWindowSamMixin:
     def _extract_outer_polygons(polygons):
         outer_polygons = []
         for polygon in polygons or []:
-            if calculate_polygon_area(polygon) < 0:
+            if calculate_signed_polygon_area(polygon) < 0:
                 outer_polygons.append(copy.deepcopy(polygon))
         if outer_polygons:
             return outer_polygons
         return copy.deepcopy(polygons or [])
 
-    def _append_preannotation_event(self, record, event_type, details=None, semantic_action=None):
+    def _append_preannotation_event(self, record, event_type, details=None):
         append_event(
             record,
             event_type,
             details=details,
             reason_code=record.get("active_reason_code"),
-            semantic_action=semantic_action,
         )
 
     def _finalize_preannotation_record(self, record):
-        if record.get("semantic_action_source") != "manual":
-            set_semantic_action(record, None, source="auto")
-        semantic_action = record.get("semantic_action")
-        if semantic_action == "ignore":
+        event_types = {entry.get("event_type") for entry in record.get("event_log", []) if entry.get("event_type")}
+        if event_types & {"candidate_ignored", "instance_ignored"}:
             set_status(record, "ignored")
-        elif semantic_action == "reject":
-            set_status(record, "rejected")
-        elif semantic_action == "merge":
+        elif event_types & {"proposal_merged"}:
             set_status(record, "merged")
-        elif record.get("event_log"):
-            set_status(record, "modified")
+        elif event_types & {"candidate_rejected", "delete_instance"} and not record.get("final_polygons"):
+            set_status(record, "rejected")
         else:
             set_status(record, "accepted")
 
     def _build_preannotation_record(self, candidate, formal_instance_id=None, status="accepted"):
-        semantic_action = self.preannotation_default_semantic_action or SEMANTIC_ACTION_AUTO
-        if status == "accepted" and semantic_action in ("ignore", "reject"):
-            semantic_action = SEMANTIC_ACTION_AUTO
+        candidate_state = self._record_state_snapshot(candidate.get("polygons", []), candidate.get("labels", []))
         record = normalize_record(
             {
                 "record_id": self._next_preannotation_record_id(),
@@ -346,18 +374,17 @@ class MainWindowSamMixin:
                 "roi_box": copy.deepcopy(candidate.get("roi_box", [])),
                 "candidate_id": candidate.get("candidate_id"),
                 "confidence": candidate.get("confidence"),
-                "original_polygons": copy.deepcopy(candidate.get("polygons", [])),
-                "final_polygons": copy.deepcopy(candidate.get("polygons", [])),
+                "original_polygons": candidate_state["polygons"],
+                "original_labels": candidate_state["labels"],
+                "final_polygons": candidate_state["polygons"],
+                "final_labels": candidate_state["labels"],
                 "formal_instance_id": formal_instance_id,
                 "status": status,
                 "event_log": [],
+                "reason_segments": [],
             }
         )
         set_active_reason(record, self.preannotation_default_reason_code)
-        if semantic_action == SEMANTIC_ACTION_AUTO:
-            set_semantic_action(record, None, source="auto")
-        else:
-            set_semantic_action(record, semantic_action, source="manual")
         return record
 
     def _remove_preannotation_formal_instance(self, instance_id):
@@ -375,22 +402,11 @@ class MainWindowSamMixin:
         context = self._get_active_preannotation_context()
         if context.get("kind") == "candidate":
             candidate = context.get("candidate")
-            record = self._build_preannotation_record(candidate, formal_instance_id=None, status="ignored")
-            set_semantic_action(record, "ignore", source="manual")
-            set_status(record, "ignored")
-            self._append_preannotation_event(
-                record,
-                "candidate_ignored",
-                {"candidate_id": candidate.get("candidate_id")},
-                semantic_action="ignore",
-            )
-            self.preannotation_adjustment_records.append(record)
             self.left_label.ignored_regions.extend(self._extract_outer_polygons(candidate.get("polygons", [])))
             self._clear_preannotation_candidate()
             self.mark_annotation_changed()
             self.sync_summary_view()
             self.update_undo_redo_state()
-            self._persist_preannotation_adjustment_records()
             self.sam_info_text.append(f"已忽略 proposal: {candidate.get('candidate_id')}")
             return
 
@@ -409,18 +425,7 @@ class MainWindowSamMixin:
             plant = self._find_plant_by_id(instance_id)
         if not plant:
             return
-        record = self._find_preannotation_record(plant.get("preannotation_record_id"))
-        if not record:
-            return
-        record["final_polygons"] = copy.deepcopy(plant.get("polygons", []))
-        set_semantic_action(record, "ignore", source="manual")
-        set_status(record, "ignored")
-        self._append_preannotation_event(
-            record,
-            "instance_ignored",
-            {"formal_instance_id": instance_id},
-            semantic_action="ignore",
-        )
+        self._remove_preannotation_record(plant.get("preannotation_record_id"))
         self.left_label.ignored_regions.extend(self._extract_outer_polygons(plant.get("polygons", [])))
         self._remove_preannotation_formal_instance(instance_id)
         self.mark_annotation_changed()
@@ -431,29 +436,14 @@ class MainWindowSamMixin:
         self._update_preannotation_controls()
         self.sam_info_text.append(f"已忽略 proposal instance={instance_id}")
 
-    def record_preannotation_instance_deleted(self, plant, semantic_action=None):
+    def record_preannotation_instance_deleted(self, plant):
         if not plant or not plant.get("preannotation_record_id"):
             return False
-        record = self._find_preannotation_record(plant.get("preannotation_record_id"))
-        if not record:
-            return False
-
-        chosen_action = semantic_action or self._get_current_preannotation_semantic_action()
-        if chosen_action != "merge":
-            chosen_action = "reject"
-        record["formal_instance_id"] = int(plant.get("id", 0))
-        record["final_polygons"] = []
-        set_semantic_action(record, chosen_action, source="manual")
-        set_status(record, "merged" if chosen_action == "merge" else "rejected")
-        self._append_preannotation_event(
-            record,
-            "proposal_merged" if chosen_action == "merge" else "delete_instance",
-            {"formal_instance_id": int(plant.get("id", 0))},
-            semantic_action=chosen_action,
-        )
-        self._persist_preannotation_adjustment_records()
+        removed = self._remove_preannotation_record(plant.get("preannotation_record_id"))
+        if removed:
+            self._persist_preannotation_adjustment_records()
         self._update_preannotation_controls()
-        return True
+        return removed
 
     def _update_preannotation_controls(self):
         context = self._get_active_preannotation_context()
@@ -473,9 +463,7 @@ class MainWindowSamMixin:
             self.btn_ignore_preannotation.setEnabled(has_active_record)
         if hasattr(self, "combo_preannotation_reason"):
             self.combo_preannotation_reason.setEnabled(has_image)
-        if hasattr(self, "combo_preannotation_semantic_action"):
-            self.combo_preannotation_semantic_action.setEnabled(has_image)
-        self._sync_preannotation_judgement_ui()
+        self._sync_preannotation_reason_ui()
 
     def _clear_preannotation_candidate(self, clear_box=True):
         self.current_preannotation_candidate = None
@@ -656,6 +644,7 @@ class MainWindowSamMixin:
 
         self._clear_preannotation_candidate()
         self.left_label.select_entity("formal", instance_id)
+        self.preannotation_pending_fine_tune_entries.add(int(instance_id))
         self.left_label.enter_fine_tune_mode(instance_id)
         self.btn_fine_tune.setText("退出微调模式")
         self.btn_add_vertex.setEnabled(True)
@@ -680,24 +669,16 @@ class MainWindowSamMixin:
             QMessageBox.warning(self, "警告", "当前没有可拒绝的预标注候选")
             return
 
-        record = self._build_preannotation_record(candidate, formal_instance_id=None, status="rejected")
-        set_semantic_action(record, "reject", source="manual")
-        set_status(record, "rejected")
-        self._append_preannotation_event(
-            record,
-            "candidate_rejected",
-            {"candidate_id": candidate.get("candidate_id")},
-            semantic_action="reject",
-        )
-        self.preannotation_adjustment_records.append(record)
-
         candidate_id = candidate.get("candidate_id")
         self._clear_preannotation_candidate()
-        self._persist_preannotation_adjustment_records()
         self.sam_info_text.append(f"已拒绝候选: {candidate_id}")
         self._update_preannotation_controls()
 
     def on_fine_tune_session_started(self, instance_id):
+        instance_id = int(instance_id or 0)
+        if instance_id not in self.preannotation_pending_fine_tune_entries:
+            return
+        self.preannotation_pending_fine_tune_entries.discard(instance_id)
         plant = self._find_plant_by_id(instance_id)
         if not plant:
             return
@@ -709,14 +690,17 @@ class MainWindowSamMixin:
             "record_id": record_id,
             "event_log_len": len(record.get("event_log", [])),
             "final_polygons": copy.deepcopy(record.get("final_polygons", [])),
+            "final_labels": copy.deepcopy(record.get("final_labels", [])),
             "status": record.get("status"),
-            "semantic_action": record.get("semantic_action"),
-            "semantic_action_source": record.get("semantic_action_source"),
             "reason_codes": copy.deepcopy(record.get("reason_codes", [])),
             "active_reason_code": record.get("active_reason_code"),
+            "reason_segments": copy.deepcopy(record.get("reason_segments", [])),
+            "active_reason_segment_index": record.get("active_reason_segment_index"),
         }
 
     def on_fine_tune_session_finished(self, instance_id, saved):
+        instance_id = int(instance_id or 0)
+        self.preannotation_pending_fine_tune_entries.discard(instance_id)
         session = self.preannotation_fine_tune_sessions.pop(instance_id, None)
         if not session:
             return
@@ -726,20 +710,28 @@ class MainWindowSamMixin:
         if saved:
             plant = self._find_plant_by_id(instance_id)
             if plant:
-                record["final_polygons"] = copy.deepcopy(plant.get("polygons", []))
+                self._set_record_final_state(record, plant.get("polygons", []), plant.get("labels", []))
+            self._close_reason_segment(record)
             self._finalize_preannotation_record(record)
         else:
             record["event_log"] = record.get("event_log", [])[:session["event_log_len"]]
             record["operations"] = copy.deepcopy(record["event_log"])
             record["final_polygons"] = copy.deepcopy(session["final_polygons"])
+            record["final_labels"] = copy.deepcopy(session["final_labels"])
             record["status"] = session.get("status")
-            record["semantic_action"] = session.get("semantic_action")
-            record["semantic_action_source"] = session.get("semantic_action_source")
             record["reason_codes"] = copy.deepcopy(session.get("reason_codes", []))
             record["active_reason_code"] = session.get("active_reason_code")
+            record["reason_segments"] = copy.deepcopy(session.get("reason_segments", []))
+            record["active_reason_segment_index"] = session.get("active_reason_segment_index")
+        normalized_record = normalize_record(record)
+        record.clear()
+        record.update(normalized_record)
         self._persist_preannotation_adjustment_records()
 
     def record_preannotation_adjustment_action(self, instance_id, action_type, details):
+        instance_id = int(instance_id or 0)
+        if instance_id not in self.preannotation_fine_tune_sessions:
+            return
         plant = self._find_plant_by_id(instance_id)
         if not plant:
             return
@@ -747,21 +739,36 @@ class MainWindowSamMixin:
         record = self._find_preannotation_record(record_id)
         if not record:
             return
-        self._append_preannotation_event(record, action_type, copy.deepcopy(details))
-        record["final_polygons"] = copy.deepcopy(plant.get("polygons", []))
+        before_state = self._get_record_final_state_snapshot(record)
+        after_state = self._get_plant_state_snapshot(plant)
+        self._append_reasoned_adjustment(
+            record,
+            action_type,
+            copy.deepcopy(details),
+            before_state=before_state,
+            after_state=after_state,
+        )
         self._finalize_preannotation_record(record)
+        self._persist_preannotation_adjustment_records()
 
     def on_entity_geometry_modified(self):
         if self.left_label.mode != "fine_tune":
             return
-        instance_id = self.left_label.fine_tune_instance_id
+        instance_id = int(self.left_label.fine_tune_instance_id or 0)
+        if instance_id not in self.preannotation_fine_tune_sessions:
+            return
         plant = self._find_plant_by_id(instance_id)
         if not plant:
             return
         record_id = plant.get("preannotation_record_id")
         record = self._find_preannotation_record(record_id)
         if record:
-            record["final_polygons"] = copy.deepcopy(plant.get("polygons", []))
+            self._set_record_final_state(record, plant.get("polygons", []), plant.get("labels", []))
+            sync_active_reason_segment(
+                record,
+                polygons=record.get("final_polygons", []),
+                labels=record.get("final_labels", []),
+            )
             self._finalize_preannotation_record(record)
 
     def export_preannotation_adjustments(self):
